@@ -1,7 +1,8 @@
-import ExcelJS from 'exceljs';
+import loadExcelJS from './loadExcelJS.js';
 import { prepareExportRecords, summarizeExportRecords } from './sensorExports.js';
 
 export async function createExcelBuffer(readings, { aquariumName, aquariumId, dateRangeLabel, exportedAt = new Date() }) {
+  const ExcelJS = await loadExcelJS();
   const records = prepareExportRecords(readings);
   const summary = summarizeExportRecords(records);
   const workbook = new ExcelJS.Workbook();

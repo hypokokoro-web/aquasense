@@ -13,6 +13,7 @@ import { aquasenseAssistantUrl, isSupabaseConfigured, supabase, supabasePublisha
 import ReactMarkdown from 'react-markdown';
 import 'katex/dist/katex.min.css';
 import { aquaSenseRemarkPlugins, aquaSenseRehypePlugins, prepareMarkdownMath, safeMarkdownUrl } from './lib/aquaSenseMarkdown';
+import loadExcelJS from './lib/loadExcelJS';
 import { collectPagedReadings, createCsv, prepareExportRecords, resolveHistoryBounds, summarizeExportRecords } from './lib/sensorExports';
 import './styles.css';
 
@@ -814,7 +815,7 @@ function Dashboard({ user, onSignOut, appInstalled, onInstallApp }) {
       ];
       const filename = report.title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
       if (format === 'xlsx') {
-        const ExcelJS = (await import('exceljs')).default;
+        const ExcelJS = await loadExcelJS();
         const workbook = new ExcelJS.Workbook();
         workbook.creator = 'AquaSense';
         workbook.created = new Date();
