@@ -1301,6 +1301,17 @@ function Dashboard({ user, onSignOut, appInstalled, onInstallApp }) {
               <LogOut size={16} />
             </button>
           </div>
+          <nav className="sidebar-legal-links" aria-label="Legal and account information">
+            <a href="/privacy.html" target="_blank" rel="noreferrer" title="Privacy policy">
+              <ShieldCheck size={15} /><span>Privacy policy</span>
+            </a>
+            <a href="/terms.html" target="_blank" rel="noreferrer" title="Terms of Service">
+              <FileText size={15} /><span>Terms of Service</span>
+            </a>
+            <a href="/data-deletion.html" target="_blank" rel="noreferrer" title="Data deletion instructions">
+              <Trash2 size={15} /><span>Data deletion</span>
+            </a>
+          </nav>
         </div>
       </aside>
 
