@@ -16,6 +16,10 @@ import { aquaSenseRemarkPlugins, aquaSenseRehypePlugins, prepareMarkdownMath, sa
 import loadExcelJS from './lib/loadExcelJS';
 import { collectPagedReadings, createCsv, prepareExportRecords, resolveHistoryBounds, summarizeExportRecords } from './lib/sensorExports';
 import './styles.css';
+import AdminDashboard from './AdminDashboard';
+import { canAccessAdminRoute, canOfferSocialLogin, hasPasswordAuthMethod, resolveAquaSenseRole, SOCIAL_LOGIN_PROVIDERS } from './lib/authorization';
+import { callAquaSenseAdmin } from './lib/adminApi';
+import { maskEmailAddress, resendSignupOtp, SIGNUP_OTP_PATTERN, verifySignupOtp } from './lib/emailOtp';
 
 const demoNow = Date.now();
 const demoReadings = Array.from({ length: 48 }, (_, i) => ({
@@ -90,6 +94,7 @@ const markdownComponents = {
 };
 
 const createExploreMessageId = () => globalThis.crypto?.randomUUID?.() || `chat-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+const createExploreChat = () => ({ id: createExploreMessageId(), title: 'New chat', updatedAt: new Date().toISOString(), messages: [{ id: 'aqua-welcome', role: 'assistant', content: 'Greetings! I am **AquaSense AI**. How can I help optimize your water chemistry, heating schedules, or fish care today?' }] });
 const copyTextToClipboard = async text => {
   if (navigator.clipboard?.writeText) {
     try { await navigator.clipboard.writeText(text); return; } catch {}
@@ -174,7 +179,7 @@ function TrendChartCard({ title, subtitle, value, unit, dataKey, data, color, gr
   );
 }
 
-function AuthLoadingScreen({ title = 'Signing in securely', detail = 'Verifying administrator access' }) {
+function AuthLoadingScreen({ title = 'Signing in securely', detail = 'Verifying account access' }) {
   return (
     <div className="auth-loading-screen" role="status" aria-live="polite">
       <div className="auth-loading-scene" aria-hidden="true">
@@ -224,14 +229,42 @@ function makeComputedAlerts(latest, limits, deviceOnline) {
   return alerts;
 }
 
-function AdminLogin({ onLogin }) {
+function isAdminPortalRoute(pathname = window.location.pathname, hash = window.location.hash) {
+  return pathname === '/admin' || pathname.startsWith('/admin/') || hash === '#/admin' || hash.startsWith('#/admin/');
+}
+
+function LoginPage({ onLogin, onAuthAttempt, adminPortal = false, initialError = '' }) {
+  const [loginFishFact] = useState(() => FISH_GUIDE[Math.floor(Math.random() * FISH_GUIDE.length)]);
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState('');
+  const [error, setError] = useState(initialError);
+  const [registering, setRegistering] = useState(false);
+  const [verificationEmail, setVerificationEmail] = useState('');
+  const [otp, setOtp] = useState('');
+  const [resendSeconds, setResendSeconds] = useState(0);
+  const verificationRequest = useRef(false);
+
+  useEffect(() => {
+    const handlePageShow = event => {
+      if (!event.persisted) return;
+      setBusy(false);
+      setError('');
+      void supabase.auth.signOut({ scope: 'local' }).catch(() => {});
+    };
+    window.addEventListener('pageshow', handlePageShow);
+    return () => window.removeEventListener('pageshow', handlePageShow);
+  }, []);
+
+  useEffect(() => {
+    if (resendSeconds <= 0) return undefined;
+    const timer = window.setInterval(() => setResendSeconds(seconds => Math.max(0, seconds - 1)), 1000);
+    return () => window.clearInterval(timer);
+  }, [resendSeconds > 0]);
 
   const handleSubmit = async event => {
     event.preventDefault(); setBusy(true); setError('');
+    onAuthAttempt?.(true);
     const startedAt = Date.now();
     let authenticatedUser = null;
     try {
@@ -240,23 +273,152 @@ function AdminLogin({ onLogin }) {
         setError('Email or password is incorrect.');
       } else {
         const { data: admin, error: adminError } = await supabase.from('aquasense_admins').select('user_id').eq('user_id', data.user.id).maybeSingle();
-        if (adminError || !admin) {
+        if (adminError) {
           await supabase.auth.signOut();
-          setError('This account does not have supervisor access.');
+          setError('Could not verify your account role. Please try again.');
         } else {
-          authenticatedUser = data.user;
+          const aquasenseRole = resolveAquaSenseRole(admin, null);
+          const hasExpectedRole = adminPortal ? aquasenseRole === 'admin' : aquasenseRole === 'user';
+          if (!hasExpectedRole) {
+            await supabase.auth.signOut();
+            setError(adminPortal
+              ? 'This account is not an administrator. Use the user sign-in page.'
+              : 'This is an administrator account. Use the administrator sign-in page.');
+          } else if (adminPortal && !hasPasswordAuthMethod(data.session?.access_token)) {
+            await supabase.auth.signOut();
+            setError('Administrator sign-in requires your email and password.');
+          } else authenticatedUser = { ...data.user, aquasenseRole };
         }
       }
     } catch (err) {
       setError(err?.message || 'Sign-in failed.');
     }
     await new Promise(resolve => window.setTimeout(resolve, Math.max(0, 3000 - (Date.now() - startedAt))));
+    onAuthAttempt?.(false);
     if (authenticatedUser) onLogin(authenticatedUser);
     else setBusy(false);
   };
 
+  const completeRegularSignup = async (user, session) => {
+    const { data: membership, error: membershipError } = await supabase
+      .from('aquasense_admins')
+      .select('user_id')
+      .eq('user_id', user.id)
+      .maybeSingle();
+    if (membershipError) {
+      await supabase.auth.signOut({ scope: 'local' });
+      setError('Could not verify your account role. Please sign in again.');
+      return;
+    }
+    const aquasenseRole = resolveAquaSenseRole(membership, null);
+    if (aquasenseRole !== 'user' || (adminPortal && !hasPasswordAuthMethod(session?.access_token))) {
+      await supabase.auth.signOut({ scope: 'local' });
+      setError('Administrator accounts must use the administrator sign-in page.');
+      return;
+    }
+    onLogin({ ...user, aquasenseRole });
+  };
+
+  const submitRegistration = async event => {
+    event.preventDefault();
+    if (busy) return;
+    setBusy(true); setError('');
+    try {
+      const signupEmail = email.trim();
+      const { data, error: signUpError } = await supabase.auth.signUp({
+        email: signupEmail,
+        password,
+        options: { emailRedirectTo: window.location.origin },
+      });
+      if (signUpError) throw signUpError;
+      if (data.session && data.user) {
+        await completeRegularSignup(data.user, data.session);
+      } else if (data.user) {
+        setVerificationEmail(signupEmail);
+        setOtp('');
+        setResendSeconds(60);
+        setError('');
+      } else {
+        setError('A verification request could not be started. Check the email address and try again.');
+      }
+    } catch (err) {
+      setError(err?.message || 'Registration failed.');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const submitSignupOtp = async event => {
+    event.preventDefault();
+    const token = otp.trim();
+    if (!SIGNUP_OTP_PATTERN.test(token)) {
+      setError('Enter the 6–12 digit code from your email.');
+      return;
+    }
+    if (verificationRequest.current) return;
+    verificationRequest.current = true;
+    setBusy(true); setError('');
+    try {
+      const { data, error: verifyError } = await verifySignupOtp(supabase, verificationEmail, token);
+      if (verifyError) throw verifyError;
+      if (data.user && data.session) {
+        await completeRegularSignup(data.user, data.session);
+      } else {
+        const { data: sessionData, error: sessionError } = await supabase.auth.getSession();
+        if (sessionError) throw sessionError;
+        if (sessionData.session?.user) {
+          await completeRegularSignup(sessionData.session.user, sessionData.session);
+        } else {
+          setVerificationEmail('');
+          setRegistering(false);
+          setOtp('');
+          setError('Email verified. Sign in with your email and password to continue.');
+        }
+      }
+    } catch (err) {
+      setError(err?.message || 'The code could not be verified. Request a new code and try again.');
+    } finally {
+      verificationRequest.current = false;
+      setBusy(false);
+    }
+  };
+
+  const resendSignupCode = async () => {
+    if (!verificationEmail || resendSeconds > 0 || verificationRequest.current) return;
+    verificationRequest.current = true;
+    setBusy(true); setError('');
+    try {
+      const { error: resendError } = await resendSignupOtp(supabase, verificationEmail);
+      if (resendError) throw resendError;
+      setOtp('');
+      setResendSeconds(60);
+      setError('A new verification code was requested. Check your inbox and spam folder.');
+    } catch (err) {
+      setError(err?.message || 'Could not resend the verification code. Please try again later.');
+    } finally {
+      verificationRequest.current = false;
+      setBusy(false);
+    }
+  };
+
+  const startSocialSignIn = async provider => {
+    if (!canOfferSocialLogin(adminPortal, registering) || !SOCIAL_LOGIN_PROVIDERS.includes(provider)) return;
+    setBusy(true);
+    setError('');
+    try {
+      const { error: oauthError } = await supabase.auth.signInWithOAuth({
+        provider,
+        options: { redirectTo: window.location.origin },
+      });
+      if (oauthError) throw oauthError;
+    } catch (oauthError) {
+      setError(oauthError?.message || `Could not start ${provider} sign-in.`);
+      setBusy(false);
+    }
+  };
+
   return (
-    <main className="auth-screen">
+    <main className="auth-screen auth-screen-split">
       <div className="auth-ocean-scene" aria-hidden="true">
         <i className="auth-bubble auth-bubble-one" />
         <i className="auth-bubble auth-bubble-two" />
@@ -266,21 +428,52 @@ function AdminLogin({ onLogin }) {
         <i className="auth-bubble auth-bubble-six" />
       </div>
       {busy && <AuthLoadingScreen />}
+      <div className="auth-split-layout">
       <section className="auth-card">
         <div className="auth-brand">
           <div className="brand-mark"><img src="/images/aquasense-logo.png" alt="" aria-hidden="true" /></div>
           <div><strong>AquaSense</strong><small>AQUARIUM INTELLIGENCE</small></div>
         </div>
-        <h1>Welcome back</h1>
-        <p className="auth-description">Sign in to manage your aquarium monitoring dashboard.</p>
+        {adminPortal && <div className="login-portal-label">ADMINISTRATOR PORTAL</div>}
+        <h1>{verificationEmail ? 'Verify your email' : registering ? 'Create your account' : adminPortal ? 'Administrator sign in' : 'Welcome back'}</h1>
+        <p className="auth-description">{verificationEmail ? 'Enter the numeric verification code sent to your email to finish creating your AquaSense account.' : registering ? 'Create an account to monitor your aquarium.' : adminPortal ? 'Sign in to manage AquaSense accounts and platform data.' : 'Sign in to view and manage your aquarium.'}</p>
+        {!verificationEmail && canOfferSocialLogin(adminPortal, registering) && isSupabaseConfigured && (
+          <div className="social-login-options" aria-label="Social sign-in options">
+            <button type="button" className="social-login-button" onClick={() => void startSocialSignIn('google')} disabled={busy}>
+              <GoogleMark /> <span>Continue with Google</span>
+            </button>
+            <button type="button" className="social-login-button" onClick={() => void startSocialSignIn('facebook')} disabled={busy}>
+              <FacebookMark /> <span>Continue with Facebook</span>
+            </button>
+          </div>
+        )}
+        {!verificationEmail && canOfferSocialLogin(adminPortal, registering) && isSupabaseConfigured && (
+          <div className="auth-divider" role="separator" aria-label="or"><span>or</span></div>
+        )}
         {!isSupabaseConfigured ? (
           <div className="auth-error" role="alert">Supabase not configured in .env.local</div>
         ) : (
-          <form onSubmit={handleSubmit}>
-            <label htmlFor="admin-email">Email Address</label>
-            <input id="admin-email" type="email" value={email} onChange={e => setEmail(e.target.value)} placeholder="admin@example.com" required />
-            <label htmlFor="admin-password">Password</label>
-            <input id="admin-password" type="password" value={password} onChange={e => setPassword(e.target.value)} placeholder="Enter password" required />
+          verificationEmail ? <div className="signup-verification">
+            <p className="verification-destination">Verification code sent to <strong>{maskEmailAddress(verificationEmail)}</strong></p>
+            <form onSubmit={submitSignupOtp}>
+              <label htmlFor="signup-otp">Email verification code</label>
+              <input id="signup-otp" type="text" value={otp} onChange={event => setOtp(event.target.value.replace(/\D/g, '').slice(0, 12))} placeholder="Enter your code" autoComplete="one-time-code" inputMode="numeric" pattern="[0-9]{6,12}" minLength={6} maxLength={12} aria-describedby="signup-otp-help" required />
+              <small id="signup-otp-help">Enter the 6–12 digit code from your signup email.</small>
+              {error && <div className="auth-error" role="status">{error}</div>}
+              <button className="auth-submit" type="submit" disabled={busy || !SIGNUP_OTP_PATTERN.test(otp.trim())}>
+                <span>{busy ? 'Verifying...' : 'Verify email'}</span>
+                <Fish className="auth-submit-fish" size={16} aria-hidden="true" />
+              </button>
+            </form>
+            <button type="button" className="auth-switch" onClick={() => void resendSignupCode()} disabled={busy || resendSeconds > 0}>
+              {busy ? 'Please wait...' : resendSeconds > 0 ? `Resend code in ${resendSeconds}s` : 'Resend verification code'}
+            </button>
+            <button type="button" className="auth-switch" disabled={busy} onClick={() => { setVerificationEmail(''); setOtp(''); setError(''); setRegistering(true); }}>Return to signup</button>
+          </div> : <form onSubmit={registering ? submitRegistration : handleSubmit}>
+            <label htmlFor="login-email">Email Address</label>
+            <input id="login-email" type="email" value={email} onChange={e => setEmail(e.target.value)} placeholder="you@example.com" autoComplete="username" required />
+            <label htmlFor="login-password">Password</label>
+            <input id="login-password" type="password" value={password} onChange={e => setPassword(e.target.value)} placeholder="Enter password" autoComplete={registering ? 'new-password' : 'current-password'} required />
             {error && <div className="auth-error">{error}</div>}
             <button className="auth-submit" type="submit" disabled={busy}>
               <span className="auth-crab" aria-hidden="true">
@@ -295,22 +488,55 @@ function AdminLogin({ onLogin }) {
                   <circle cx="45" cy="11" r="1" fill="#123b4b" />
                 </svg>
               </span>
-              <span>{busy ? 'Signing in...' : 'Sign in securely'}</span>
+              <span>{busy ? 'Please wait...' : registering ? 'Create account' : 'Sign in'}</span>
               <Fish className="auth-submit-fish" size={16} aria-hidden="true" />
             </button>
           </form>
         )}
-        <p className="auth-footnote"><ShieldCheck size={14} /> Protected administrator sign-in</p>
+        {!adminPortal && !verificationEmail && <button type="button" className="auth-switch" onClick={() => { setRegistering(value => !value); setError(''); }}>{registering ? 'Already have an account? Sign in' : "Don't have an account? Sign up"}</button>}
+        {adminPortal && <p className="auth-footnote"><ShieldCheck size={14} /> Administrator access is verified securely</p>}
+        {adminPortal && <a className="login-portal-switch" href="#/login">Go to user sign in</a>}
       </section>
+      <aside className="auth-promo" aria-label="AquaSense aquarium monitoring">
+        <div className="auth-promo-content">
+          <span className="auth-promo-kicker">FISH FACT / {loginFishFact.group.toUpperCase()}</span>
+          <h2><span className="auth-promo-title-intro">Meet the</span><br /><span>{loginFishFact.name}</span></h2>
+          <p>{loginFishFact.note}</p>
+        </div>
+        <span className="auth-promo-caption"><span>SCIENTIFIC NAME</span><em>{loginFishFact.scientific}</em></span>
+      </aside>
+      </div>
     </main>
   );
 }
 
+function GoogleMark() {
+  return <svg aria-hidden="true" viewBox="0 0 48 48" className="social-provider-mark"><path fill="#FFC107" d="M43.6 20.5H42V20H24v8h11.3A12 12 0 1 1 32 15.1l5.7-5.7A20 20 0 1 0 44 24c0-1.2-.1-2.4-.4-3.5Z"/><path fill="#FF3D00" d="m6.3 14.7 6.6 4.8A12 12 0 0 1 32 15.1l5.7-5.7A20 20 0 0 0 6.3 14.7Z"/><path fill="#4CAF50" d="M24 44a20 20 0 0 0 13.5-5.2l-6.2-5.2A12 12 0 0 1 12.9 29l-6.5 5A20 20 0 0 0 24 44Z"/><path fill="#1976D2" d="M43.6 20.5H42V20H24v8h11.3a12 12 0 0 1-4 5.6l6.2 5.2A20 20 0 0 0 44 24c0-1.2-.1-2.4-.4-3.5Z"/></svg>;
+}
+
+function FacebookMark() {
+  return <svg aria-hidden="true" viewBox="0 0 24 24" className="social-provider-mark"><path fill="#1877F2" d="M24 12a12 12 0 1 0-13.875 11.85v-8.38H7.08V12h3.045V9.356c0-3.006 1.792-4.668 4.532-4.668 1.312 0 2.686.234 2.686.234v2.953h-1.513c-1.49 0-1.955.925-1.955 1.874V12h3.328l-.532 3.47h-2.796v8.38A12.002 12.002 0 0 0 24 12Z"/><path fill="#FFF" d="m16.67 15.47.532-3.47h-3.328V9.749c0-.95.465-1.874 1.955-1.874h1.513V4.922s-1.374-.234-2.686-.234c-2.74 0-4.532 1.662-4.532 4.668V12H7.08v3.47h3.045v8.38a12.1 12.1 0 0 0 3.75 0v-8.38h2.795Z"/></svg>;
+}
+
 export default function App() {
   const [auth, setAuth] = useState({ ready: false, user: null });
+  const [locationHash, setLocationHash] = useState(() => window.location.hash);
   const [installPrompt, setInstallPrompt] = useState(null);
   const [appInstalled, setAppInstalled] = useState(() => window.matchMedia('(display-mode: standalone)').matches || window.navigator.standalone === true);
   const logoutInProgress = useRef(false);
+  const loginAttemptPending = useRef(false);
+
+  useEffect(() => {
+    const syncHash = () => setLocationHash(window.location.hash);
+    window.addEventListener('hashchange', syncHash);
+    return () => window.removeEventListener('hashchange', syncHash);
+  }, []);
+
+  useEffect(() => {
+    if (auth.user?.aquasenseRole === 'admin' && !isAdminPortalRoute(window.location.pathname, locationHash)) {
+      window.location.hash = '#/admin';
+    }
+  }, [auth.user?.id, auth.user?.aquasenseRole, locationHash]);
 
   useEffect(() => {
     if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
@@ -344,18 +570,31 @@ export default function App() {
     const verifySession = async session => {
       const request = ++verification;
       const user = session?.user;
-      if (!user) { if (active && request === verification) setAuth({ ready: true, user: null }); return; }
-      const { data, error } = await supabase.from('aquasense_admins').select('user_id').eq('user_id', user.id).maybeSingle();
-      if (!active || request !== verification) return;
-      if (error || !data) {
-        setAuth({ ready: true, user: null });
-        if (!error) setTimeout(() => supabase.auth.signOut(), 0);
+      if (!user) {
+        if (active && request === verification) {
+          setAuth(current => ({ ready: true, user: null, loginError: current.loginError || '' }));
+        }
         return;
       }
-      setAuth({ ready: true, user });
+      const { data, error } = await supabase.from('aquasense_admins').select('user_id').eq('user_id', user.id).maybeSingle();
+      if (!active || request !== verification) return;
+      if (error) {
+        setAuth({ ready: true, user: null });
+        setTimeout(() => supabase.auth.signOut(), 0);
+        return;
+      }
+      const aquasenseRole = resolveAquaSenseRole(data, null);
+      if (aquasenseRole === 'admin' && !hasPasswordAuthMethod(session?.access_token)) {
+        const loginError = 'Administrator accounts must use the administrator sign-in page with email and password.';
+        setAuth({ ready: true, user: null, loginError });
+        await supabase.auth.signOut({ scope: 'local' });
+        return;
+      }
+      setAuth({ ready: true, user: { ...user, aquasenseRole } });
     };
 
     const { data: listener } = supabase.auth.onAuthStateChange((_event, session) => {
+      if (_event === 'SIGNED_IN' && loginAttemptPending.current) return;
       if (_event === 'SIGNED_OUT' && logoutInProgress.current) return;
       setTimeout(() => verifySession(session), 0);
     });
@@ -384,25 +623,53 @@ export default function App() {
     if (!window.history.state?.aquasenseAuthGuard) {
       window.history.pushState({ ...(window.history.state || {}), aquasenseAuthGuard: true, moduleName: moduleFromLocation() }, '', window.location.href);
     }
-    const handleBackNavigation = event => {
-      if (event.state?.aquasenseAuthGuard) return;
+    const handleBackNavigation = () => {
       setAuth({ ready: true, user: null });
+      const isAdminPath = window.location.pathname === '/admin' || window.location.pathname.startsWith('/admin/');
+      const appPath = isAdminPath ? '/' : window.location.pathname;
+      window.history.replaceState(null, '', `${appPath}${window.location.search}#/login`);
+      setLocationHash('#/login');
       void supabase.auth.signOut({ scope: 'local' });
     };
     window.addEventListener('popstate', handleBackNavigation);
     return () => window.removeEventListener('popstate', handleBackNavigation);
   }, [auth.user?.id]);
 
-  if (!auth.ready) return <main className="auth-screen"><AuthLoadingScreen title="Checking your session" detail="Restoring secure administrator access" /></main>;
-  if (!auth.user) return <AdminLogin onLogin={user => setAuth({ ready: true, user })} />;
+  if (!auth.ready) return <main className="auth-screen"><AuthLoadingScreen title="Checking your session" detail="Restoring your secure session" /></main>;
+  const adminRoute = isAdminPortalRoute(window.location.pathname, locationHash);
+  if (!auth.user) return <LoginPage adminPortal={adminRoute} initialError={auth.loginError || ''} onLoginAttempt={pending => { loginAttemptPending.current = pending; }} onLogin={user => setAuth({ ready: true, user })} />;
+  if (auth.user.aquasenseRole === 'admin' && !adminRoute) {
+    return <main className="auth-screen"><AuthLoadingScreen title="Opening administrator console" detail="Taking you to the administrator portal" /></main>;
+  }
+  if (adminRoute && !canAccessAdminRoute(auth.user.aquasenseRole)) return <AccessDenied />;
 
   return <>
-    <Dashboard user={auth.user} onSignOut={handleSignOut} appInstalled={appInstalled} onInstallApp={handleInstallApp} />
+    {adminRoute
+      ? <AdminDashboard user={auth.user} onSignOut={handleSignOut} />
+      : <Dashboard user={auth.user} onSignOut={handleSignOut} appInstalled={appInstalled} onInstallApp={handleInstallApp} />}
     {auth.signingOut && <AuthLoadingScreen title="Signing out securely" detail="Closing your administrator session–" />}
   </>;
 }
 
+function AccessDenied() {
+  return <main className="auth-screen"><section className="auth-card"><h1>Access denied</h1><p className="auth-description">Administrator access is required for this page.</p><a className="auth-submit admin-denied-link" href="#/dashboard">Return to your dashboard</a></section></main>;
+}
+
 function Dashboard({ user, onSignOut, appInstalled, onInstallApp }) {
+  const [announcements, setAnnouncements] = useState([]);
+  useEffect(() => {
+    let active = true;
+    const loadAnnouncements = async () => {
+      if (!isSupabaseConfigured) return;
+      try {
+        const result = await callAquaSenseAdmin('list_announcements');
+        if (active) setAnnouncements(Array.isArray(result.announcements) ? result.announcements.slice(0, 3) : []);
+      } catch { if (active) setAnnouncements([]); }
+    };
+    void loadAnnouncements();
+    const interval = window.setInterval(loadAnnouncements, 5 * 60 * 1000);
+    return () => { active = false; window.clearInterval(interval); };
+  }, [user.id]);
   const adminDisplayName = [
     user?.user_metadata?.full_name,
     user?.user_metadata?.name,
@@ -429,6 +696,10 @@ function Dashboard({ user, onSignOut, appInstalled, onInstallApp }) {
   }, []);
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [showSignOutConfirm, setShowSignOutConfirm] = useState(false);
+  const [renameChatId, setRenameChatId] = useState(null);
+  const [renameChatDraft, setRenameChatDraft] = useState('');
+  const renameChatInputRef = useRef(null);
+  const [deleteChatTarget, setDeleteChatTarget] = useState(null);
   useEffect(() => {
     if (!showSignOutConfirm) return;
     const closeOnEscape = event => {
@@ -437,12 +708,26 @@ function Dashboard({ user, onSignOut, appInstalled, onInstallApp }) {
     window.addEventListener('keydown', closeOnEscape);
     return () => window.removeEventListener('keydown', closeOnEscape);
   }, [showSignOutConfirm]);
+  useEffect(() => {
+    if (!renameChatId) return;
+    renameChatInputRef.current?.focus();
+    const closeOnEscape = event => { if (event.key === 'Escape') setRenameChatId(null); };
+    window.addEventListener('keydown', closeOnEscape);
+    return () => window.removeEventListener('keydown', closeOnEscape);
+  }, [renameChatId]);
+  useEffect(() => {
+    if (!deleteChatTarget) return;
+    const closeOnEscape = event => { if (event.key === 'Escape') setDeleteChatTarget(null); };
+    window.addEventListener('keydown', closeOnEscape);
+    return () => window.removeEventListener('keydown', closeOnEscape);
+  }, [deleteChatTarget]);
   const [readings, setReadings] = useState(isSupabaseConfigured ? [] : demoReadings);
   const [historyReadings, setHistoryReadings] = useState(isSupabaseConfigured ? [] : demoReadings);
   const [historyLoading, setHistoryLoading] = useState(false);
   const [exportingFormat, setExportingFormat] = useState(null);
   const [aquariumName, setAquariumName] = useState('Home Aquarium');
   const [aquariumId, setAquariumId] = useState(null);
+  const readingsRequestInFlight = useRef(false);
   const [loading, setLoading] = useState(isSupabaseConfigured);
   const [connectionError, setConnectionError] = useState('');
   const [lastUpdated, setLastUpdated] = useState(null);
@@ -458,12 +743,25 @@ function Dashboard({ user, onSignOut, appInstalled, onInstallApp }) {
   const [clockNow, setClockNow] = useState(Date.now());
 
   // AquaSense AI chat states
-  const [exploreMessages, setExploreMessages] = useState([
-    { id: 'aqua-welcome', role: 'assistant', content: 'Greetings! I am **AquaSense AI**. How can I help optimize your water chemistry, heating schedules, or fish care today?' }
-  ]);
+  const chatStorageKey = `aquasense-ai-chats-${user?.id || 'demo'}`;
+  const [exploreChats, setExploreChats] = useState(() => {
+    try { const saved = JSON.parse(localStorage.getItem(chatStorageKey)); if (Array.isArray(saved) && saved.length) return saved; } catch {}
+    return [createExploreChat()];
+  });
+  const [activeExploreChatId, setActiveExploreChatId] = useState(() => {
+    try { const saved = JSON.parse(localStorage.getItem(chatStorageKey)); if (Array.isArray(saved) && saved.length) return saved[0].id; } catch {}
+    return null;
+  });
+  const [chatSearch, setChatSearch] = useState('');
+  const exploreMessages = exploreChats.find(chat => chat.id === activeExploreChatId)?.messages || exploreChats[0]?.messages || [];
+  const updateExploreMessages = updater => setExploreChats(chats => chats.map(chat => chat.id === activeExploreChatId ? { ...chat, messages: typeof updater === 'function' ? updater(chat.messages) : updater, updatedAt: new Date().toISOString() } : chat));
   const [exploreInput, setExploreInput] = useState('');
   const [exploreBusy, setExploreBusy] = useState(false);
   const exploreMessagesEndRef = useRef(null);
+  useEffect(() => {
+    if (!activeExploreChatId && exploreChats[0]) setActiveExploreChatId(exploreChats[0].id);
+  }, [activeExploreChatId, exploreChats]);
+  useEffect(() => { try { localStorage.setItem(chatStorageKey, JSON.stringify(exploreChats)); } catch {} }, [chatStorageKey, exploreChats]);
   const alertSyncKey = useRef('');
   const notifiedAlertTypes = useRef(null);
   const [savedAlerts, setSavedAlerts] = useState([]);
@@ -529,13 +827,18 @@ function Dashboard({ user, onSignOut, appInstalled, onInstallApp }) {
       setReadings(demoReadings); setLastUpdated(new Date().toISOString());
       return;
     }
+    // A slow Supabase request must not overlap the next poll or a manual refresh.
+    if (readingsRequestInFlight.current) return;
+    readingsRequestInFlight.current = true;
     setLoading(true); setConnectionError('');
     try {
-      const { data: tank, error: tankError } = await supabase.from('aquariums').select('id, name').order('created_at', { ascending: true }).limit(1).maybeSingle();
+      let aquariumQuery = supabase.from('aquariums').select('id, name').order('created_at', { ascending: true }).limit(1);
+      if (user?.aquasenseRole === 'admin') aquariumQuery = aquariumQuery.eq('owner_id', user.id);
+      const { data: tank, error: tankError } = await aquariumQuery.maybeSingle();
       if (tankError) throw tankError;
       if (!tank) {
         setAquariumId(null); setReadings([]); setHistoryReadings([]);
-        setConnectionError('No registered aquarium profile found in database.');
+        setConnectionError('No aquarium is accessible to this account. Ask an administrator to assign your account as owner of the aquarium registered to this ESP32. Existing aquariums are not automatically assigned to an account.');
         return;
       }
       setAquariumId(tank.id); setAquariumName(tank.name || 'Home Aquarium');
@@ -556,9 +859,10 @@ function Dashboard({ user, onSignOut, appInstalled, onInstallApp }) {
     } catch (err) {
       setConnectionError(err?.message || 'Could not load data.');
     } finally {
+      readingsRequestInFlight.current = false;
       setLoading(false);
     }
-  }, []);
+  }, [user?.id, user?.aquasenseRole]);
 
   useEffect(() => {
     fetchReadings();
@@ -913,7 +1217,8 @@ function Dashboard({ user, onSignOut, appInstalled, onInstallApp }) {
       .slice(-12)
       .map(({ role, content }) => ({ role, content }));
     setExploreInput('');
-    setExploreMessages(items => [...items, { id: createExploreMessageId(), role: 'user', content: message }]);
+    updateExploreMessages(items => [...items, { id: createExploreMessageId(), role: 'user', content: message }]);
+    setExploreChats(chats => chats.map(chat => chat.id === activeExploreChatId ? { ...chat, title: chat.title === 'New chat' ? message.slice(0, 48) : chat.title, updatedAt: new Date().toISOString() } : chat));
     setExploreBusy(true);
 
     try {
@@ -943,9 +1248,9 @@ function Dashboard({ user, onSignOut, appInstalled, onInstallApp }) {
       if (typeof result.answer !== 'string' || !result.answer.trim()) {
         throw new Error('AquaSense AI returned an empty answer. Please try again.');
       }
-      setExploreMessages(items => [...items, { id: createExploreMessageId(), role: 'assistant', content: result.answer.trim() }]);
+      updateExploreMessages(items => [...items, { id: createExploreMessageId(), role: 'assistant', content: result.answer.trim(), sources: Array.isArray(result.sources) ? result.sources : [] }]);
     } catch (error) {
-      setExploreMessages(items => [...items, {
+      updateExploreMessages(items => [...items, {
         id: createExploreMessageId(),
         role: 'assistant',
         content: `I couldn't get a response: ${error?.message || 'Please try again.'}`
@@ -956,7 +1261,7 @@ function Dashboard({ user, onSignOut, appInstalled, onInstallApp }) {
   };
 
   return (
-    <div className={`app-shell ${sidebarCollapsed ? 'sidebar-collapsed' : ''}`} data-theme={theme}>
+    <div className={`app-shell ${sidebarCollapsed ? 'sidebar-collapsed' : ''} ${activeNav === 'Explore' ? 'explore-mode' : ''}`} data-theme={theme}>
       {mobileNavOpen && <div className="sidebar-scrim" onClick={() => setMobileNavOpen(false)} />}
 
       <aside className={`sidebar ${mobileNavOpen ? 'open' : ''}`}>
@@ -1030,6 +1335,11 @@ function Dashboard({ user, onSignOut, appInstalled, onInstallApp }) {
         </header>
 
         <div className="page-content">
+          {announcements.map(announcement => <article className={`notice platform-announcement announcement-${announcement.category}`} key={announcement.id}>
+            <Bell size={17} aria-hidden="true" />
+            <div><strong>{announcement.title}</strong><span>{announcement.message}</span></div>
+            <span className="announcement-category">{announcement.category.replaceAll('_', ' ')}</span>
+          </article>)}
           {!['Fish Encyclopedia', 'Explore', 'Alerts', 'Reports', 'Care Planner'].includes(activeNav) && (
             <section className="welcome-row">
               <button className="refresh-button" onClick={fetchReadings} disabled={loading}>
@@ -1044,6 +1354,22 @@ function Dashboard({ user, onSignOut, appInstalled, onInstallApp }) {
               <Activity size={18} />
               <div>Running in demonstration mode with simulated telemetry. Connect Supabase to stream physical sensor readings.</div>
               <span className="notice-tag">PREVIEW</span>
+            </div>
+          )}
+
+          {isSupabaseConfigured && connectionError && (
+            <div className="notice connection-error" role="alert">
+              <AlertTriangle size={17} />
+              <div><strong>Could not load aquarium readings</strong><span>{connectionError}</span></div>
+              <button className="secondary-button" onClick={fetchReadings} disabled={loading}>Retry</button>
+            </div>
+          )}
+
+          {isSupabaseConfigured && !loading && !connectionError && aquariumId && readings.length === 0 && (
+            <div className="notice" role="status">
+              <Activity size={17} />
+              <div>No sensor readings were returned for aquarium {aquariumId}. Confirm this is the aquarium assigned to the ESP32 device.</div>
+              <button className="secondary-button" onClick={fetchReadings} disabled={loading}>Refresh</button>
             </div>
           )}
 
@@ -1073,8 +1399,8 @@ function Dashboard({ user, onSignOut, appInstalled, onInstallApp }) {
                 <article className="summary-tile">
                   <span className="summary-title"><Wifi size={16} /> DEVICE <i aria-hidden="true">🐡</i></span>
                   <strong className="summary-word">{deviceOnline ? 'Online' : 'Standby'}</strong>
-                  <StatusPill tone={deviceOnline ? 'good' : 'neutral'}>
-                    {deviceOnline ? 'Connected' : 'Demo Stream'}
+                  <StatusPill tone={!isSupabaseConfigured || deviceOnline ? 'good' : 'neutral'}>
+                    {!isSupabaseConfigured ? 'Demo Stream' : deviceOnline ? 'Connected' : loading ? 'Checking...' : 'No heartbeat'}
                   </StatusPill>
                 </article>
 
@@ -1300,6 +1626,11 @@ function Dashboard({ user, onSignOut, appInstalled, onInstallApp }) {
 
           {activeNav === 'Explore' && (
             <section className="explore-chat">
+              <aside className="chat-history">
+                <div className="chat-history-head"><strong>Chats</strong><button className="secondary-button" onClick={() => { const chat = createExploreChat(); setExploreChats(chats => [chat, ...chats]); setActiveExploreChatId(chat.id); setExploreInput(''); }}><Sparkles size={14}/> New chat</button></div>
+                <label className="chat-search"><Search size={14}/><input value={chatSearch} onChange={event => setChatSearch(event.target.value)} placeholder="Search chats" aria-label="Search chats"/></label>
+                <div className="chat-history-list">{exploreChats.filter(chat => chat.title.toLowerCase().includes(chatSearch.toLowerCase())).map(chat => <div key={chat.id} className={`chat-history-item ${chat.id === activeExploreChatId ? 'active' : ''}`}><button className="chat-history-select" onClick={() => setActiveExploreChatId(chat.id)}><strong>{chat.title}</strong><span>{new Date(chat.updatedAt).toLocaleDateString()}</span></button><button className="icon-button" title="Rename chat" aria-label={`Rename ${chat.title}`} onClick={() => { setRenameChatId(chat.id); setRenameChatDraft(chat.title); }}><MoreHorizontal size={15}/></button><button className="icon-button" title="Delete chat" aria-label={`Delete ${chat.title}`} onClick={() => setDeleteChatTarget(chat)}><Trash2 size={14}/></button></div>)}</div>
+              </aside>
               <div className="explore-chat-body">
                 <div className="chat-intro">
                   <strong>AquaSense AI Assistant</strong>
@@ -1317,6 +1648,8 @@ function Dashboard({ user, onSignOut, appInstalled, onInstallApp }) {
                       <ReactMarkdown remarkPlugins={aquaSenseRemarkPlugins} rehypePlugins={aquaSenseRehypePlugins} components={markdownComponents}>
                         {msg.content}
                       </ReactMarkdown>
+                      {msg.sources?.length > 0 && <div className="chat-sources"><strong>Sources</strong>{msg.sources.map((source, index) => <a key={`${source.citation}-${index}`} href={safeMarkdownUrl(source.url) || undefined} target="_blank" rel="noreferrer"><span>{source.citation}</span>{source.title}<small>{source.source}</small></a>)}</div>}
+                      {msg.role === 'assistant' && msg.id !== 'aqua-welcome' && <button className="chat-copy" title="Copy response" onClick={() => copyTextToClipboard(msg.content).catch(() => {})}><Copy size={13}/> Copy</button>}
                     </div>
                   ))}
                   {exploreBusy && (
@@ -1384,6 +1717,30 @@ function Dashboard({ user, onSignOut, appInstalled, onInstallApp }) {
               <button className="secondary-button" onClick={() => setShowSignOutConfirm(false)}>Cancel</button>
               <button className="signout-confirm-button" onClick={() => { setShowSignOutConfirm(false); onSignOut(); }}><LogOut size={15} /> Sign out</button>
             </div>
+          </section>
+        </div>
+      )}
+      {renameChatId && (
+        <div className="signout-confirm-backdrop" onMouseDown={event => { if (event.target === event.currentTarget) setRenameChatId(null); }}>
+          <section className="signout-confirm-dialog rename-chat-dialog" role="dialog" aria-modal="true" aria-labelledby="rename-chat-title" aria-describedby="rename-chat-description">
+            <button type="button" className="rename-chat-close" aria-label="Close" onClick={() => setRenameChatId(null)}>×</button>
+            <h2 id="rename-chat-title">Rename chat</h2>
+            <p id="rename-chat-description">Give this conversation a name you’ll recognize later.</p>
+            <form onSubmit={event => { event.preventDefault(); const title = renameChatDraft.trim(); if (!title) return; setExploreChats(chats => chats.map(chat => chat.id === renameChatId ? { ...chat, title, updatedAt: new Date().toISOString() } : chat)); setRenameChatId(null); }}>
+              <label htmlFor="rename-chat-input">Chat name</label>
+              <input ref={renameChatInputRef} id="rename-chat-input" value={renameChatDraft} maxLength={80} onChange={event => setRenameChatDraft(event.target.value)} placeholder="e.g. Water quality plan" />
+              <div className="signout-confirm-actions"><button type="button" className="secondary-button" onClick={() => setRenameChatId(null)}>Cancel</button><button className="rename-chat-save" type="submit" disabled={!renameChatDraft.trim()}>Save name</button></div>
+            </form>
+          </section>
+        </div>
+      )}
+      {deleteChatTarget && (
+        <div className="signout-confirm-backdrop" onMouseDown={event => { if (event.target === event.currentTarget) setDeleteChatTarget(null); }}>
+          <section className="signout-confirm-dialog rename-chat-dialog delete-chat-dialog" role="alertdialog" aria-modal="true" aria-labelledby="delete-chat-title" aria-describedby="delete-chat-description">
+            <button type="button" className="rename-chat-close" aria-label="Close" onClick={() => setDeleteChatTarget(null)}>×</button>
+            <h2 id="delete-chat-title">Delete chat?</h2>
+            <p id="delete-chat-description">“{deleteChatTarget.title}” will be permanently removed from your chat history.</p>
+            <div className="signout-confirm-actions"><button className="secondary-button" onClick={() => setDeleteChatTarget(null)}>Cancel</button><button className="delete-chat-confirm" onClick={() => { const deletingId = deleteChatTarget.id; setExploreChats(chats => { const remaining = chats.filter(chat => chat.id !== deletingId); if (!remaining.length) { const fresh = createExploreChat(); setActiveExploreChatId(fresh.id); return [fresh]; } if (activeExploreChatId === deletingId) setActiveExploreChatId(remaining[0].id); return remaining; }); setDeleteChatTarget(null); }}>Delete chat</button></div>
           </section>
         </div>
       )}

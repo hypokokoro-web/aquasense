@@ -1,0 +1,11 @@
+[functions.ingest-reading]
+# Device requests use x-device-key and per-device registry authorization.
+# Supabase gateway JWT verification is disabled; the function must authenticate
+# every request itself before accessing data with its service-role client.
+verify_jwt = false
+
+[functions.aquasense-admin]
+# Browser CORS preflight requests do not include the user's Authorization token.
+# The function handles OPTIONS itself and verifies the bearer token and admin
+# allowlist membership on every POST before using privileged credentials.
+verify_jwt = false

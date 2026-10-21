@@ -25,6 +25,7 @@
   "devDependencies": {
     "@vitejs/plugin-react": "^4.3.4",
     "autoprefixer": "^10.6.1",
+    "exceljs": "^4.4.0",
     "postcss": "^8.5.31",
     "supabase": "^2.121.0",
     "tailwindcss": "^4.3.3",

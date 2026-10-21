@@ -6,6 +6,9 @@ const key = import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY;
 export const aquasenseAssistantUrl = url
   ? `${url.replace(/\/+$/, '')}/functions/v1/aquasense-assistant`
   : '';
+export const aquasenseAdminUrl = url
+  ? `${url.replace(/\/+$/, '')}/functions/v1/aquasense-admin`
+  : '';
 export const supabasePublishableKey = key;
 
 export const isSupabaseConfigured = Boolean(

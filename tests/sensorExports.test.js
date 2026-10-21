@@ -4,6 +4,9 @@ import ExcelJS from 'exceljs';
 import { collectPagedReadings, createCsv, prepareExportRecords, protectSpreadsheetText, resolveHistoryBounds, summarizeExportRecords } from '../src/lib/sensorExports.js';
 import { createExcelBuffer } from '../src/lib/sensorExcel.js';
 
+// The browser loads this bundle from /vendor; tests provide its npm equivalent.
+globalThis.window = { ExcelJS };
+
 const records = [
   { id: 3, aquarium_id: 8, temperature: null, ph_level: 7.2, source: 'manual_test', created_at: '2026-10-20T02:30:00+08:00' },
   { id: 2, aquarium_id: 8, temperature: -2.5, ph_level: '', source: 'esp32', created_at: '2026-10-20T01:30:00Z' },
