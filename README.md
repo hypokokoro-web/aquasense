@@ -40,6 +40,9 @@ VITE_SUPABASE_PUBLISHABLE_KEY=sb_publishable_your_key
 
 Only put a publishable key in the frontend. Never put a `sb_secret_...` or legacy `service_role` key in `.env.local` or browser code.
 
+## FadeHost Free plan
+The Free plan's memory limit can be too low for Vite to build this dashboard on the host. Build it locally with `npm run build`, then commit the generated `dist/` folder along with your source changes. In FadeHost, set the Build command to `true` and the Start command to `npm start`; the app serves the committed static build without running Vite on the 256 MB host. Rebuild `dist/` locally whenever frontend code or the Supabase frontend settings change.
+
 ## 5. Verify
 - Dashboard should show `Supabase mode`.
 - Temperature and pH should load from `sensor_readings`.
