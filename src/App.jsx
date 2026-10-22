@@ -1175,15 +1175,17 @@ function Dashboard({ user, onSignOut, appInstalled, onInstallApp }) {
     for (const reading of readings) {
       const temperature = Number(reading.temperature);
       const ph = Number(reading.ph_level);
+      const readingTimestamp = validDate(reading.created_at) ? new Date(reading.created_at).toISOString() : new Date().toISOString();
       if (temperature < limits.temp_min || temperature > limits.temp_max) {
-        events.push({ aquarium_id: aquariumId, fingerprint: `temperature:${reading.id}`, alert_type: 'temperature', severity: 'warning', message: `Temperature ${temperature.toFixed(1)} °C is outside the configured ${limits.temp_min}–${limits.temp_max} °C range.`, source_reading_id: reading.id, first_seen_at: reading.created_at, last_seen_at: reading.created_at, created_at: reading.created_at });
+        events.push({ aquarium_id: aquariumId, fingerprint: `temperature:${reading.id}`, alert_type: 'temperature', severity: 'warning', message: `Temperature ${temperature.toFixed(1)} °C is outside the configured ${limits.temp_min}–${limits.temp_max} °C range.`, source_reading_id: reading.id, first_seen_at: readingTimestamp, last_seen_at: readingTimestamp, created_at: readingTimestamp });
       }
       if (ph < limits.ph_min || ph > limits.ph_max) {
-        events.push({ aquarium_id: aquariumId, fingerprint: `ph:${reading.id}`, alert_type: 'ph', severity: 'warning', message: `pH ${ph.toFixed(2)} is outside the configured ${limits.ph_min}–${limits.ph_max} range.`, source_reading_id: reading.id, first_seen_at: reading.created_at, last_seen_at: reading.created_at, created_at: reading.created_at });
+        events.push({ aquarium_id: aquariumId, fingerprint: `ph:${reading.id}`, alert_type: 'ph', severity: 'warning', message: `pH ${ph.toFixed(2)} is outside the configured ${limits.ph_min}–${limits.ph_max} range.`, source_reading_id: reading.id, first_seen_at: readingTimestamp, last_seen_at: readingTimestamp, created_at: readingTimestamp });
       }
     }
     if (deviceOnline === false) {
-      events.push({ aquarium_id: aquariumId, fingerprint: `device-offline:${lastDeviceSeen || 'no-heartbeat'}`, alert_type: 'device_offline', severity: 'critical', message: 'No ESP32 heartbeat has arrived within the configured timeout.', first_seen_at: new Date().toISOString(), last_seen_at: new Date().toISOString() });
+      const offlineAt = new Date().toISOString();
+      events.push({ aquarium_id: aquariumId, fingerprint: `device-offline:${lastDeviceSeen || 'no-heartbeat'}`, alert_type: 'device_offline', severity: 'critical', message: 'No ESP32 heartbeat has arrived within the configured timeout.', first_seen_at: offlineAt, last_seen_at: offlineAt, created_at: offlineAt });
     }
     const syncKey = `${events.map(event => event.fingerprint).sort().join('|')}|device-state:${deviceOnline}`;
     if (syncKey === alertSyncKey.current) return;
