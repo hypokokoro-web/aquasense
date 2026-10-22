@@ -22,6 +22,21 @@ Deno.serve(createIngestHandler({
     minimumIntervalMs: Deno.env.get('AQUASENSE_INGEST_MIN_INTERVAL_MS'),
   }),
   hashDeviceKey,
+  async loadSettings() {
+    const { data, error } = await serviceClient().from('aquasense_platform_settings')
+      .select('setting_key,setting_value').in('setting_key', [
+        'esp32_minimum_interval_ms', 'esp32_temperature_min', 'esp32_temperature_max', 'esp32_ph_min', 'esp32_ph_max',
+      ]);
+    if (error) throw error;
+    const settings = Object.fromEntries((data || []).map(row => [row.setting_key, row.setting_value]));
+    return {
+      esp32_minimum_interval_ms: settings.esp32_minimum_interval_ms ?? 1000,
+      esp32_temperature_min: settings.esp32_temperature_min ?? 0,
+      esp32_temperature_max: settings.esp32_temperature_max ?? 50,
+      esp32_ph_min: settings.esp32_ph_min ?? 0,
+      esp32_ph_max: settings.esp32_ph_max ?? 14,
+    };
+  },
   async findDevice(deviceKeyHash: string) {
     const { data, error } = await serviceClient().from('aquasense_devices')
       .select('device_id,aquarium_id,is_active,temperature_min,temperature_max,ph_min,ph_max')

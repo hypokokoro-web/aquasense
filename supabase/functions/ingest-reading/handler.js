@@ -70,7 +70,7 @@ function validDeviceKey(key) {
   return typeof key === 'string' && key.length >= DEVICE_KEY_MIN_LENGTH && key.length <= DEVICE_KEY_MAX_LENGTH && !/[\r\n]/.test(key);
 }
 
-export function createIngestHandler({ env, hashDeviceKey, findDevice, consumeRateLimit, insertReading, logEvent, now = () => Date.now(), logger = console }) {
+export function createIngestHandler({ env, hashDeviceKey, findDevice, consumeRateLimit, insertReading, logEvent, loadSettings, now = () => Date.now(), logger = console }) {
   return async request => {
     const corsHeaders = {
       'Access-Control-Allow-Origin': '*',
@@ -112,6 +112,13 @@ export function createIngestHandler({ env, hashDeviceKey, findDevice, consumeRat
     }
     if (!device || device.is_active !== true) return response({ success: false, message: 'Invalid device credentials.' }, 401, corsHeaders);
 
+    let platformSettings = {};
+    try { if (loadSettings) platformSettings = await loadSettings(); }
+    catch (error) {
+      logger.error('Reading ingestion platform settings lookup failed.', { code: error?.code || 'unknown' });
+      return response({ success: false, message: 'Reading ingestion is temporarily unavailable.' }, 503, corsHeaders);
+    }
+
     const recordEvent = async (eventCode, outcome, aquariumId = device.aquarium_id) => {
       if (!logEvent) return;
       try { await logEvent({ device_id: device.device_id, aquarium_id: aquariumId, event_code: eventCode, outcome }); }
@@ -122,6 +129,22 @@ export function createIngestHandler({ env, hashDeviceKey, findDevice, consumeRat
     if (parsed.error) {
       await recordEvent('invalid_payload', 'rejected');
       return response({ success: false, message: parsed.error }, 400, corsHeaders);
+    }
+
+    const globalLimits = {
+      temperature_min: Number(platformSettings.esp32_temperature_min ?? 0),
+      temperature_max: Number(platformSettings.esp32_temperature_max ?? 50),
+      ph_min: Number(platformSettings.esp32_ph_min ?? 0),
+      ph_max: Number(platformSettings.esp32_ph_max ?? 14),
+    };
+    if (!Object.values(globalLimits).every(Number.isFinite) || globalLimits.temperature_min < 0 || globalLimits.temperature_max > 50 || globalLimits.temperature_min >= globalLimits.temperature_max || globalLimits.ph_min < 0 || globalLimits.ph_max > 14 || globalLimits.ph_min >= globalLimits.ph_max) {
+      logger.error('Reading ingestion has invalid platform measurement defaults.');
+      return response({ success: false, message: 'Reading ingestion is not configured.' }, 503, corsHeaders);
+    }
+    const platformRangeCheck = parseReading(body, globalLimits);
+    if (platformRangeCheck.error) {
+      await recordEvent('measurement_out_of_range', 'rejected');
+      return response({ success: false, message: platformRangeCheck.error }, 400, corsHeaders);
     }
 
     const registeredAquariumId = normalizeAquariumId(device.aquarium_id);
@@ -145,8 +168,8 @@ export function createIngestHandler({ env, hashDeviceKey, findDevice, consumeRat
     }
 
     const timestamp = now();
-    const minimumIntervalMs = Number(secrets.minimumIntervalMs ?? DEFAULT_MIN_INTERVAL_MS);
-    if (!Number.isSafeInteger(minimumIntervalMs) || minimumIntervalMs < 0 || minimumIntervalMs > 60000) {
+    const minimumIntervalMs = Number(platformSettings.esp32_minimum_interval_ms ?? secrets.minimumIntervalMs ?? DEFAULT_MIN_INTERVAL_MS);
+    if (!Number.isSafeInteger(minimumIntervalMs) || minimumIntervalMs < 100 || minimumIntervalMs > 60000) {
       return response({ success: false, message: 'Reading ingestion is not configured.' }, 503, corsHeaders);
     }
     try {

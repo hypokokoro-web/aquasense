@@ -22,13 +22,13 @@
       <a class="brand" href="/">AquaSense</a>
       <h1>Data Deletion Instructions</h1>
       <p class="muted">Last updated: October 22, 2026</p>
-      <p>To request deletion of your AquaSense account or information, contact the AquaSense administrator who manages your account.</p>
+      <p>Signed-in AquaSense users can request deletion from the application. Open <strong>Settings → Security &amp; Privacy → Delete My Account</strong>, confirm your account email, complete the identity check, and submit the request.</p>
       <ol>
-        <li>Send the administrator a request from the email address associated with your AquaSense account, or identify that account email in your request.</li>
-        <li>Specify whether you want your account removed, aquarium information deleted, or both. Do not send your password, access token, or device key.</li>
-        <li>The administrator will verify the request and tell you when it has been completed or if clarification is needed.</li>
+        <li>Email/password users must provide their current password. Google and Facebook users must have signed in recently; if prompted, sign out and sign in again first.</li>
+        <li>The request removes the account's owned aquariums, sensor readings, aquarium settings, alerts, care tasks, health reports, preferences, and AquaSense authentication account. It does not delete your Google or Facebook account.</li>
+        <li>Administrator accounts are protected from self-service deletion. Contact the administrator who manages the platform to request administrator-account or other assistance.</li>
       </ol>
-      <p class="note">Deleting an authentication account can detach its ownership from an aquarium. Sensor readings and other aquarium records may require a separate deletion decision. The administrator will confirm which records are included in the request before removing them.</p>
+      <p class="note">Deletion is permanent and cannot be undone. The server verifies the signed-in account and removes only records associated with its aquarium ownership. If an unrecognized database dependency prevents safe cleanup, the request fails and the account is not reported as deleted. A failure after aquarium cleanup but before authentication-account removal requires the user to retry or contact the administrator.</p>
       <p>Information may remain temporarily in service-provider backups or be retained where required for security or legal reasons. For details about information AquaSense uses, read the <a href="/privacy.html">Privacy Policy</a>.</p>
       <footer><a href="/privacy.html">Privacy Policy</a> · <a href="/terms.html">Terms of Service</a></footer>
     </main>

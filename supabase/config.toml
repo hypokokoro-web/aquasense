@@ -9,3 +9,8 @@ verify_jwt = false
 # The function handles OPTIONS itself and verifies the bearer token and admin
 # allowlist membership on every POST before using privileged credentials.
 verify_jwt = false
+
+[functions.delete-account]
+# Browser preflight is unauthenticated. The handler validates each POST bearer
+# with Supabase Auth and checks recent authentication before using service role.
+verify_jwt = false

@@ -4,7 +4,7 @@ import {
   Clock3, Droplets, LayoutDashboard, Menu, MoreHorizontal, RefreshCw, Sparkles, Send,
   ShieldCheck, Thermometer, Waves, Wifi, WifiOff, Cpu, Database, LogOut, LoaderCircle,
   CalendarDays, FileSpreadsheet, FileText, BellRing, Search, Eye, Download, Sun, Moon, Fish,
-  BookOpen, CalendarCheck2, ChevronLeft, ChevronRight, Check, Trash2, RotateCcw
+  BookOpen, CalendarCheck2, ChevronLeft, ChevronRight, Check, Trash2, RotateCcw, Settings2
 } from 'lucide-react';
 import {
   Area, AreaChart, CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis
@@ -20,6 +20,8 @@ import AdminDashboard from './AdminDashboard';
 import { canAccessAdminRoute, canOfferSocialLogin, hasPasswordAuthMethod, resolveAquaSenseRole, SOCIAL_LOGIN_PROVIDERS } from './lib/authorization';
 import { callAquaSenseAdmin } from './lib/adminApi';
 import { maskEmailAddress, resendSignupOtp, SIGNUP_OTP_PATTERN, verifySignupOtp } from './lib/emailOtp';
+import UserSettings from './UserSettings';
+import { DEFAULT_USER_PREFERENCES, isWithinQuietHours, normalizeUserPreferences } from './lib/userPreferences';
 
 const demoNow = Date.now();
 const demoReadings = Array.from({ length: 48 }, (_, i) => ({
@@ -34,7 +36,8 @@ const DEFAULT_LIMITS = { temp_min: 22, temp_max: 28, ph_min: 6.5, ph_max: 7.8, d
 const MODULE_ROUTES = {
   Overview: 'dashboard',
   'Sensor Readings': 'sensor-history',
-  'Device Status': 'device-settings',
+  'Device Status': 'device-status',
+  Settings: 'settings',
   Alerts: 'alerts',
   Explore: 'explore',
   'Fish Encyclopedia': 'fish-encyclopedia',
@@ -42,7 +45,8 @@ const MODULE_ROUTES = {
   'Care Planner': 'care-planner',
 };
 const moduleFromLocation = () => {
-  const slug = window.location.hash.replace(/^#\/?/, '').split('/')[0];
+  const slug = window.location.hash.replace(/^#\/?/, '').split(/[/?]/)[0];
+  if (slug === 'device-settings') return 'Settings';
   return Object.entries(MODULE_ROUTES).find(([, route]) => route === slug)?.[0] || 'Overview';
 };
 const FISH_GUIDE = [
@@ -657,6 +661,7 @@ function AccessDenied() {
 
 function Dashboard({ user, onSignOut, appInstalled, onInstallApp }) {
   const [announcements, setAnnouncements] = useState([]);
+  const [maintenanceNotice, setMaintenanceNotice] = useState({ enabled: false, message: '' });
   useEffect(() => {
     let active = true;
     const loadAnnouncements = async () => {
@@ -664,10 +669,11 @@ function Dashboard({ user, onSignOut, appInstalled, onInstallApp }) {
       try {
         const result = await callAquaSenseAdmin('list_announcements');
         if (active) setAnnouncements(Array.isArray(result.announcements) ? result.announcements.slice(0, 3) : []);
-      } catch { if (active) setAnnouncements([]); }
+        if (active) setMaintenanceNotice({ enabled: result.maintenance?.enabled === true, message: result.maintenance?.message || '' });
+      } catch { if (active) { setAnnouncements([]); setMaintenanceNotice({ enabled: false, message: '' }); } }
     };
     void loadAnnouncements();
-    const interval = window.setInterval(loadAnnouncements, 5 * 60 * 1000);
+    const interval = window.setInterval(loadAnnouncements, 60 * 1000);
     return () => { active = false; window.clearInterval(interval); };
   }, [user.id]);
   const adminDisplayName = [
@@ -688,6 +694,10 @@ function Dashboard({ user, onSignOut, appInstalled, onInstallApp }) {
     try { return localStorage.getItem('aquasense-theme') === 'light' ? 'light' : 'dark'; }
     catch { return 'dark'; }
   });
+  const [userPreferences, setUserPreferences] = useState(() => normalizeUserPreferences(DEFAULT_USER_PREFERENCES));
+  const [preferencesLoading, setPreferencesLoading] = useState(isSupabaseConfigured);
+  const [preferencesError, setPreferencesError] = useState('');
+  const [aquariums, setAquariums] = useState([]);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => window.innerWidth > 820);
   useEffect(() => {
     const syncSidebarForViewport = () => setSidebarCollapsed(window.innerWidth > 820);
@@ -735,12 +745,86 @@ function Dashboard({ user, onSignOut, appInstalled, onInstallApp }) {
   const [customStart, setCustomStart] = useState(() => toLocalDateTime(new Date(Date.now() - 86400000)));
   const [customEnd, setCustomEnd] = useState(() => toLocalDateTime(new Date()));
   const [activeNav, setActiveNav] = useState(moduleFromLocation);
-  const [fahrenheit, setFahrenheit] = useState(false);
   const [limits, setLimits] = useState(DEFAULT_LIMITS);
   const [settingsForm, setSettingsForm] = useState(DEFAULT_LIMITS);
   const [settingsSaving, setSettingsSaving] = useState(false);
   const [settingsMessage, setSettingsMessage] = useState('');
   const [clockNow, setClockNow] = useState(Date.now());
+
+  const userPreferencesStorageKey = `aquasense-user-preferences-${user?.id || 'demo'}`;
+  useEffect(() => {
+    let active = true;
+    const loadPreferences = async () => {
+      setPreferencesLoading(true); setPreferencesError('');
+      if (!isSupabaseConfigured) {
+        try {
+          const local = JSON.parse(localStorage.getItem(userPreferencesStorageKey) || 'null');
+          if (active) setUserPreferences(normalizeUserPreferences(local));
+        } catch { if (active) setUserPreferences(normalizeUserPreferences(DEFAULT_USER_PREFERENCES)); }
+        if (active) setPreferencesLoading(false);
+        return;
+      }
+      try {
+        const { data, error } = await supabase.from('aquasense_user_preferences').select('notifications,appearance').eq('user_id', user.id).maybeSingle();
+        if (error) throw error;
+        if (active) setUserPreferences(normalizeUserPreferences(data || DEFAULT_USER_PREFERENCES));
+      } catch (error) {
+        if (active) {
+          setUserPreferences(normalizeUserPreferences(DEFAULT_USER_PREFERENCES));
+          setPreferencesError('Saved settings are unavailable. Apply the user settings migration, then reload this page.');
+          console.error('AquaSense user preferences could not be loaded.', { code: error?.code || 'unknown' });
+        }
+      } finally { if (active) setPreferencesLoading(false); }
+    };
+    void loadPreferences();
+    return () => { active = false; };
+  }, [user?.id, userPreferencesStorageKey]);
+
+  const saveUserPreferences = async nextValue => {
+    const next = normalizeUserPreferences(nextValue);
+    if (!isSupabaseConfigured) {
+      localStorage.setItem(userPreferencesStorageKey, JSON.stringify(next));
+      setUserPreferences(next);
+      return;
+    }
+    const { error } = await supabase.from('aquasense_user_preferences').upsert({
+      user_id: user.id,
+      notifications: next.notifications,
+      appearance: next.appearance,
+      updated_at: new Date().toISOString(),
+    }, { onConflict: 'user_id' });
+    if (error) throw error;
+    setUserPreferences(next);
+    setPreferencesError('');
+  };
+
+  const fahrenheit = userPreferences.appearance.temperatureUnit === 'F';
+  const setFahrenheit = value => {
+    const next = normalizeUserPreferences({ ...userPreferences, appearance: { ...userPreferences.appearance, temperatureUnit: value ? 'F' : 'C' } });
+    void saveUserPreferences(next).catch(error => {
+      console.error('AquaSense temperature preference could not be saved.', { code: error?.code || 'unknown' });
+    });
+  };
+  const selectAquarium = async id => {
+    setAquariumId(id);
+    const next = normalizeUserPreferences({ ...userPreferences, appearance: { ...userPreferences.appearance, defaultAquariumId: id } });
+    try { await saveUserPreferences(next); }
+    catch (error) { console.error('AquaSense default aquarium preference could not be saved.', { code: error?.code || 'unknown' }); }
+  };
+  const changeTheme = preference => {
+    previewTheme(preference);
+    const next = normalizeUserPreferences({ ...userPreferences, appearance: { ...userPreferences.appearance, theme: preference } });
+    void saveUserPreferences(next).catch(error => console.error('AquaSense theme preference could not be saved.', { code: error?.code || 'unknown' }));
+  };
+
+  const previewTheme = preference => {
+    const choice = ['light', 'dark', 'system'].includes(preference) ? preference : 'system';
+    const resolved = choice === 'system'
+      ? (window.matchMedia?.('(prefers-color-scheme: light)').matches ? 'light' : 'dark')
+      : choice;
+    setTheme(resolved);
+    try { localStorage.setItem('aquasense-theme', resolved); } catch {}
+  };
 
   // AquaSense AI chat states
   const chatStorageKey = `aquasense-ai-chats-${user?.id || 'demo'}`;
@@ -766,6 +850,31 @@ function Dashboard({ user, onSignOut, appInstalled, onInstallApp }) {
   const notifiedAlertTypes = useRef(null);
   const [savedAlerts, setSavedAlerts] = useState([]);
   const [notificationPermission, setNotificationPermission] = useState(() => 'Notification' in window ? Notification.permission : 'unsupported');
+  const seenPlatformAnnouncementIds = useRef(null);
+  useEffect(() => {
+    if (!announcements.length) return;
+    const seen = seenPlatformAnnouncementIds.current;
+    if (seen === null) {
+      seenPlatformAnnouncementIds.current = new Set(announcements.map(item => item.id));
+      return;
+    }
+    if (preferencesLoading) return;
+    const newAnnouncements = announcements.filter(item => !seen.has(item.id));
+    newAnnouncements.forEach(item => seen.add(item.id));
+    if (!newAnnouncements.length || !userPreferences.notifications.browser || !('Notification' in window) || Notification.permission !== 'granted') return;
+    const notify = async announcement => {
+      const options = {
+        body: announcement.message,
+        icon: '/images/aquasense-pwa.svg',
+        tag: `aquasense-announcement-${announcement.id}`,
+        data: { url: '/#/dashboard' },
+      };
+      const registration = await navigator.serviceWorker?.getRegistration();
+      if (registration) await registration.showNotification(announcement.title, options);
+      else new Notification(announcement.title, options);
+    };
+    for (const announcement of newAnnouncements) void notify(announcement).catch(() => {});
+  }, [announcements, preferencesLoading, userPreferences.notifications.browser]);
   const [alertFilter, setAlertFilter] = useState('active');
   const [severityFilter, setSeverityFilter] = useState('all');
   const [taskRows, setTaskRows] = useState([]);
@@ -822,6 +931,18 @@ function Dashboard({ user, onSignOut, appInstalled, onInstallApp }) {
     try { localStorage.setItem('aquasense-theme', theme); } catch {}
   }, [theme]);
 
+  useEffect(() => {
+    previewTheme(userPreferences.appearance.theme);
+  }, [userPreferences.appearance.theme]);
+
+  useEffect(() => {
+    if (userPreferences.appearance.theme !== 'system' || !window.matchMedia) return undefined;
+    const media = window.matchMedia('(prefers-color-scheme: light)');
+    const followSystemTheme = event => setTheme(event.matches ? 'light' : 'dark');
+    media.addEventListener?.('change', followSystemTheme);
+    return () => media.removeEventListener?.('change', followSystemTheme);
+  }, [userPreferences.appearance.theme]);
+
   const fetchReadings = useCallback(async () => {
     if (!isSupabaseConfigured) {
       setReadings(demoReadings); setLastUpdated(new Date().toISOString());
@@ -832,15 +953,20 @@ function Dashboard({ user, onSignOut, appInstalled, onInstallApp }) {
     readingsRequestInFlight.current = true;
     setLoading(true); setConnectionError('');
     try {
-      let aquariumQuery = supabase.from('aquariums').select('id, name').order('created_at', { ascending: true }).limit(1);
+      let aquariumQuery = supabase.from('aquariums').select('id, name, created_at').order('created_at', { ascending: true }).limit(100);
       if (user?.aquasenseRole === 'admin') aquariumQuery = aquariumQuery.eq('owner_id', user.id);
-      const { data: tank, error: tankError } = await aquariumQuery.maybeSingle();
+      const { data: accessibleAquariums, error: tankError } = await aquariumQuery;
       if (tankError) throw tankError;
+      const tanks = accessibleAquariums || [];
+      setAquariums(tanks);
+      const requestedId = aquariumId || userPreferences.appearance.defaultAquariumId;
+      const tank = tanks.find(row => String(row.id) === String(requestedId)) || tanks[0] || null;
       if (!tank) {
         setAquariumId(null); setReadings([]); setHistoryReadings([]);
         setConnectionError('No aquarium is accessible to this account. Ask an administrator to assign your account as owner of the aquarium registered to this ESP32. Existing aquariums are not automatically assigned to an account.');
         return;
       }
+      if (String(aquariumId) !== String(tank.id)) setAquariumId(tank.id);
       setAquariumId(tank.id); setAquariumName(tank.name || 'Home Aquarium');
       const [settingsResult, readingsResult] = await Promise.all([
         supabase.from('aquarium_settings').select('temp_min, temp_max, ph_min, ph_max, device_timeout_seconds').eq('aquarium_id', tank.id).maybeSingle(),
@@ -851,6 +977,9 @@ function Dashboard({ user, onSignOut, appInstalled, onInstallApp }) {
       if (settingsResult.data) {
         setLimits(settingsResult.data);
         setSettingsForm(settingsResult.data);
+      } else {
+        setLimits(DEFAULT_LIMITS);
+        setSettingsForm(DEFAULT_LIMITS);
       }
       const nextReadings = (readingsResult.data || []).filter(row => validDate(row.created_at)).reverse();
       setReadings(nextReadings);
@@ -862,7 +991,7 @@ function Dashboard({ user, onSignOut, appInstalled, onInstallApp }) {
       readingsRequestInFlight.current = false;
       setLoading(false);
     }
-  }, [user?.id, user?.aquasenseRole]);
+  }, [user?.id, user?.aquasenseRole, aquariumId, userPreferences.appearance.defaultAquariumId]);
 
   useEffect(() => {
     fetchReadings();
@@ -891,11 +1020,18 @@ function Dashboard({ user, onSignOut, appInstalled, onInstallApp }) {
     }
     const newAlerts = activeAlerts.filter(alert => !notifiedAlertTypes.current.has(alert.alert_type));
     notifiedAlertTypes.current = activeTypes;
-    if (!newAlerts.length || !('Notification' in window) || Notification.permission !== 'granted') return;
+    if (!userPreferences.notifications.browser || !newAlerts.length || !('Notification' in window) || Notification.permission !== 'granted') return;
+    if (userPreferences.notifications.quietHoursEnabled && isWithinQuietHours(new Date(), userPreferences.notifications.quietStart, userPreferences.notifications.quietEnd)) return;
+    const eligibleAlerts = newAlerts.filter(alert => {
+      if (['temperature', 'device_offline'].includes(alert.alert_type)) return userPreferences.notifications.waterQuality && userPreferences.notifications.temperature;
+      if (alert.alert_type === 'ph') return userPreferences.notifications.waterQuality && userPreferences.notifications.ph;
+      return userPreferences.notifications.waterQuality;
+    });
+    if (!eligibleAlerts.length) return;
 
     const sendNotifications = async () => {
       const registration = 'serviceWorker' in navigator ? await navigator.serviceWorker.ready.catch(() => null) : null;
-      newAlerts.forEach(alert => {
+      eligibleAlerts.forEach(alert => {
         const title = `${alert.alert_type.replaceAll('_', ' ')} alert`;
         const options = { body: alert.message, icon: '/images/aquasense-pwa.svg', badge: '/images/aquasense-pwa.svg', tag: `aquasense-${alert.alert_type}`, data: { url: '/#/alerts' } };
         if (registration) registration.showNotification(title, options);
@@ -906,22 +1042,74 @@ function Dashboard({ user, onSignOut, appInstalled, onInstallApp }) {
       });
     };
     void sendNotifications().catch(() => {});
-  }, [activeAlerts, aquariumId, loading, navigateToModule]);
+  }, [activeAlerts, aquariumId, loading, navigateToModule, userPreferences.notifications]);
+
+  useEffect(() => {
+    if (!isSupabaseConfigured || !aquariumId || !userPreferences.notifications.browser || !('Notification' in window) || Notification.permission !== 'granted') return undefined;
+    let active = true;
+    let inFlight = false;
+    const ledgerKey = `aquasense-task-notices-${user.id}`;
+    const checkDueTasks = async () => {
+      if (inFlight || document.visibilityState !== 'visible') return;
+      if (userPreferences.notifications.quietHoursEnabled && isWithinQuietHours(new Date(), userPreferences.notifications.quietStart, userPreferences.notifications.quietEnd)) return;
+      inFlight = true;
+      try {
+        const now = Date.now();
+        const { data, error } = await supabase.from('aquarium_care_tasks').select('id,title,task_type,due_at')
+          .eq('aquarium_id', aquariumId).eq('status', 'pending')
+          .gte('due_at', new Date(now - 60000).toISOString()).lte('due_at', new Date(now).toISOString()).limit(100);
+        if (error) throw error;
+        if (!active) return;
+        let delivered = [];
+        try { delivered = JSON.parse(localStorage.getItem(ledgerKey) || '[]'); } catch {}
+        const seen = new Set(Array.isArray(delivered) ? delivered : []);
+        const due = (data || []).filter(task => task.task_type === 'feeding'
+          ? userPreferences.notifications.feeding
+          : userPreferences.notifications.maintenance);
+        const fresh = due.filter(task => !seen.has(`${task.id}:${task.due_at}`));
+        if (!fresh.length) return;
+        const registration = 'serviceWorker' in navigator ? await navigator.serviceWorker.ready.catch(() => null) : null;
+        for (const task of fresh) {
+          const title = task.task_type === 'feeding' ? 'Feeding reminder' : 'Maintenance reminder';
+          const options = { body: task.title, icon: '/images/aquasense-pwa.svg', tag: `aquasense-task-${task.id}`, data: { url: '/#/care-planner' } };
+          if (registration) await registration.showNotification(title, options);
+          else new Notification(title, options);
+          seen.add(`${task.id}:${task.due_at}`);
+        }
+        localStorage.setItem(ledgerKey, JSON.stringify([...seen].slice(-200)));
+      } catch (error) {
+        console.error('AquaSense care reminders could not be checked.', { code: error?.code || 'unknown' });
+      } finally { inFlight = false; }
+    };
+    void checkDueTasks();
+    const timer = window.setInterval(checkDueTasks, 60000);
+    return () => { active = false; window.clearInterval(timer); };
+  }, [aquariumId, user?.id, userPreferences.notifications]);
 
   const measurement = val => (val == null || !Number.isFinite(Number(val)) ? null : Number(val));
   const rawTemp = latest ? measurement(latest.temperature) : null;
   const rawPh = latest ? measurement(latest.ph_level) : null;
   const displayTemp = rawTemp == null ? '–' : fahrenheit ? (rawTemp * 9 / 5 + 32).toFixed(1) : rawTemp.toFixed(1);
   const tempUnit = fahrenheit ? '°F' : '°C';
+  const formatClockTime = value => new Date(value).toLocaleTimeString([], {
+    hour: '2-digit', minute: '2-digit', hour12: userPreferences.appearance.timeFormat !== '24h',
+  });
+  const formatTimestamp = value => {
+    const date = new Date(value);
+    const datePart = userPreferences.appearance.dateFormat === 'iso'
+      ? `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`
+      : date.toLocaleDateString([], { month: 'short', day: 'numeric' });
+    return `${datePart} ${formatClockTime(value)}`;
+  };
 
   const chartData = useMemo(() => {
     return (isSupabaseConfigured ? historyReadings : demoReadings).map(row => ({
       ...row,
       timestamp: new Date(row.created_at).getTime(),
-      temperature: measurement(row.temperature),
+      temperature: measurement(row.temperature) == null ? null : fahrenheit ? measurement(row.temperature) * 9 / 5 + 32 : measurement(row.temperature),
       ph_level: measurement(row.ph_level)
     }));
-  }, [historyReadings]);
+  }, [historyReadings, fahrenheit]);
 
   const alertBadgeCount = savedAlerts.length
     ? savedAlerts.filter(alert => alert.status === 'active' && alert.severity === 'critical').length
@@ -936,12 +1124,13 @@ function Dashboard({ user, onSignOut, appInstalled, onInstallApp }) {
   const navItems = [
     { name: 'Overview', label: 'Dashboard', icon: LayoutDashboard },
     { name: 'Sensor Readings', label: 'Sensor History', icon: Activity },
-    { name: 'Device Status', label: 'Device & Settings', icon: Cpu },
+    { name: 'Device Status', label: 'Device Status', icon: Cpu },
     { name: 'Alerts', label: 'Alerts', icon: Bell, badge: alertBadgeCount },
     { name: 'Explore', label: 'AquaSense AI', icon: Sparkles },
     { name: 'Fish Encyclopedia', label: 'Fish Encyclopedia', icon: BookOpen },
     { name: 'Reports', label: 'Reports', icon: FileSpreadsheet },
-    { name: 'Care Planner', label: 'Care Planner', icon: CalendarCheck2 }
+    { name: 'Care Planner', label: 'Care Planner', icon: CalendarCheck2 },
+    { name: 'Settings', label: 'Settings', icon: Settings2 }
   ];
 
   const refreshSavedAlerts = useCallback(async () => {
@@ -1261,7 +1450,7 @@ function Dashboard({ user, onSignOut, appInstalled, onInstallApp }) {
   };
 
   return (
-    <div className={`app-shell ${sidebarCollapsed ? 'sidebar-collapsed' : ''} ${activeNav === 'Explore' ? 'explore-mode' : ''}`} data-theme={theme}>
+    <div className={`app-shell ${sidebarCollapsed ? 'sidebar-collapsed' : ''} ${activeNav === 'Explore' ? 'explore-mode' : ''} ${activeNav === 'Settings' ? 'settings-mode' : ''}`} data-theme={theme}>
       {mobileNavOpen && <div className="sidebar-scrim" onClick={() => setMobileNavOpen(false)} />}
 
       <aside className={`sidebar ${mobileNavOpen ? 'open' : ''}`}>
@@ -1280,7 +1469,10 @@ function Dashboard({ user, onSignOut, appInstalled, onInstallApp }) {
               <button
                 key={name}
                 onClick={() => navigateToModule(name)}
-                className={`nav-item ${activeNav === name ? 'active' : ''}`}
+                className={`nav-item ${name === 'Settings' ? 'nav-item-settings' : ''} ${activeNav === name ? 'active' : ''}`}
+                title={label}
+                aria-label={label}
+                aria-current={activeNav === name ? 'page' : undefined}
               >
                 <Icon size={18} />
                 <span>{label}</span>
@@ -1301,17 +1493,6 @@ function Dashboard({ user, onSignOut, appInstalled, onInstallApp }) {
               <LogOut size={16} />
             </button>
           </div>
-          <nav className="sidebar-legal-links" aria-label="Legal and account information">
-            <a href="/privacy.html" target="_blank" rel="noreferrer" title="Privacy policy">
-              <ShieldCheck size={15} /><span>Privacy policy</span>
-            </a>
-            <a href="/terms.html" target="_blank" rel="noreferrer" title="Terms of Service">
-              <FileText size={15} /><span>Terms of Service</span>
-            </a>
-            <a href="/data-deletion.html" target="_blank" rel="noreferrer" title="Data deletion instructions">
-              <Trash2 size={15} /><span>Data deletion</span>
-            </a>
-          </nav>
         </div>
       </aside>
 
@@ -1325,7 +1506,7 @@ function Dashboard({ user, onSignOut, appInstalled, onInstallApp }) {
           </div>
 
           <div className="topbar-actions">
-            <button className="icon-button" onClick={() => setTheme(t => t === 'dark' ? 'light' : 'dark')} title="Toggle theme">
+            <button className="icon-button" onClick={() => changeTheme(theme === 'dark' ? 'light' : 'dark')} title="Toggle theme">
               {theme === 'dark' ? <Sun size={17} /> : <Moon size={17} />}
             </button>
 
@@ -1346,17 +1527,21 @@ function Dashboard({ user, onSignOut, appInstalled, onInstallApp }) {
         </header>
 
         <div className="page-content">
+          {maintenanceNotice.enabled && <article className="notice platform-maintenance-banner" role="status"><AlertTriangle size={18} aria-hidden="true"/><div><strong>Scheduled maintenance</strong><span>{maintenanceNotice.message}</span></div></article>}
           {announcements.map(announcement => <article className={`notice platform-announcement announcement-${announcement.category}`} key={announcement.id}>
             <Bell size={17} aria-hidden="true" />
             <div><strong>{announcement.title}</strong><span>{announcement.message}</span></div>
             <span className="announcement-category">{announcement.category.replaceAll('_', ' ')}</span>
           </article>)}
-          {!['Fish Encyclopedia', 'Explore', 'Alerts', 'Reports', 'Care Planner'].includes(activeNav) && (
+          {!['Fish Encyclopedia', 'Explore', 'Alerts', 'Reports', 'Care Planner', 'Settings'].includes(activeNav) && (
             <section className="welcome-row">
               <button className="refresh-button" onClick={fetchReadings} disabled={loading}>
                 <RefreshCw size={14} className={loading ? 'spin' : ''} />
                 {loading ? 'Syncing...' : 'Sync Data'}
               </button>
+              {activeNav === 'Sensor Readings' && <button className="secondary-button sensor-report-button" onClick={() => navigateToModule('Reports')}>
+                <FileText size={15} /> Generate Report
+              </button>}
             </section>
           )}
 
@@ -1417,7 +1602,7 @@ function Dashboard({ user, onSignOut, appInstalled, onInstallApp }) {
 
                 <article className="summary-tile">
                   <span className="summary-title"><Clock3 size={16} /> LAST READING <i aria-hidden="true">🦈</i></span>
-                  <strong className="summary-word">{latest ? fmtTime(latest.created_at) : 'No Data'}</strong>
+                  <strong className="summary-word">{latest ? formatClockTime(latest.created_at) : 'No Data'}</strong>
                   <StatusPill tone="neutral">DS18B20 & pH</StatusPill>
                 </article>
               </section>
@@ -1502,7 +1687,7 @@ function Dashboard({ user, onSignOut, appInstalled, onInstallApp }) {
               <section className="charts-grid">
                 <TrendChartCard
                   title="Water Temperature History"
-                  subtitle="Recorded continuous telemetry (°C)"
+                  subtitle={`Recorded continuous telemetry (${tempUnit})`}
                   value={displayTemp}
                   unit={tempUnit}
                   dataKey="temperature"
@@ -1541,7 +1726,7 @@ function Dashboard({ user, onSignOut, appInstalled, onInstallApp }) {
                 <article className="panel device-widget">
                   <span className="device-widget-icon"><Clock3 size={18} /></span>
                   <span className="device-widget-label">LAST HEARTBEAT</span>
-                  <strong>{lastDeviceSeen ? fmtDateTime(lastDeviceSeen) : 'No heartbeat yet'}</strong>
+                  <strong>{lastDeviceSeen ? formatTimestamp(lastDeviceSeen) : 'No heartbeat yet'}</strong>
                   <span className="device-widget-detail">{lastDeviceSeen ? `${Math.floor(deviceAgeSeconds / 60)} min ago – timeout ${deviceTimeout}s` : 'Waiting for an ESP32 reading'}</span>
                 </article>
                 <article className="panel device-widget">
@@ -1551,39 +1736,37 @@ function Dashboard({ user, onSignOut, appInstalled, onInstallApp }) {
                   <span className="device-widget-detail">Source: {lastDeviceSeen ? 'ESP32' : latest?.source || 'No readings'}</span>
                 </article>
               </section>
-
-              <section className="panel device-settings-panel">
-                <div className="panel-header">
-                  <div><h2>Aquarium settings</h2><p>Set safe water ranges and the device heartbeat timeout for {aquariumName}.</p></div>
-                  <Database size={19} />
-                </div>
-                <form className="device-settings-form" onSubmit={saveSettings}>
-                  <div className="settings-field-group">
-                    <div className="settings-group-heading"><Thermometer size={16} /><strong>Temperature range</strong><span>°C</span></div>
-                    <label>Minimum temperature<input name="temp_min" type="number" min="-5" max="60" step="0.1" required value={settingsForm.temp_min} onChange={event => setSettingsForm(form => ({ ...form, temp_min: event.target.value }))} /></label>
-                    <label>Maximum temperature<input name="temp_max" type="number" min="-5" max="60" step="0.1" required value={settingsForm.temp_max} onChange={event => setSettingsForm(form => ({ ...form, temp_max: event.target.value }))} /></label>
-                  </div>
-                  <div className="settings-field-group">
-                    <div className="settings-group-heading"><Droplets size={16} /><strong>pH range</strong><span>pH</span></div>
-                    <label>Minimum pH<input name="ph_min" type="number" min="0" max="14" step="0.1" required value={settingsForm.ph_min} onChange={event => setSettingsForm(form => ({ ...form, ph_min: event.target.value }))} /></label>
-                    <label>Maximum pH<input name="ph_max" type="number" min="0" max="14" step="0.1" required value={settingsForm.ph_max} onChange={event => setSettingsForm(form => ({ ...form, ph_max: event.target.value }))} /></label>
-                  </div>
-                  <div className="settings-field-group settings-timeout-group">
-                    <div className="settings-group-heading"><Clock3 size={16} /><strong>Device timeout</strong><span>seconds</span></div>
-                    <label>Mark device offline after<input name="device_timeout_seconds" type="number" min="30" step="1" required value={settingsForm.device_timeout_seconds ?? 300} onChange={event => setSettingsForm(form => ({ ...form, device_timeout_seconds: event.target.value }))} /></label>
-                    <p>Minimum 30 seconds. Used to detect a missed ESP32 heartbeat.</p>
-                  </div>
-                  <div className="settings-form-footer">
-                    <span role="status" className={settingsMessage && /saved|updated/i.test(settingsMessage) ? 'settings-message success' : 'settings-message'}>{settingsMessage || (isSupabaseConfigured ? 'Changes apply to alerts and device status.' : 'Demo mode keeps changes for this session.')}</span>
-                    <button className="refresh-button settings-save-button" type="submit" disabled={settingsSaving || (isSupabaseConfigured && !aquariumId)}>
-                      {settingsSaving ? <LoaderCircle size={15} className="spin" /> : <CheckCircle2 size={15} />}
-                      {settingsSaving ? 'Saving...' : 'Save settings'}
-                    </button>
-                  </div>
-                </form>
-              </section>
+              <section className="panel device-settings-panel"><div className="panel-header"><div><h2>Device status</h2><p>Live connection details for {aquariumName}.</p></div><Database size={19}/></div><p className="settings-help">Update alert thresholds and device timeout under <button className="inline-link-button" onClick={() => navigateToModule('Settings')}>Settings → Aquarium Preferences</button>.</p></section>
             </div>
           )}
+
+          {activeNav === 'Settings' && <UserSettings
+            user={user}
+            supabase={supabase}
+            isSupabaseConfigured={isSupabaseConfigured}
+            preferences={userPreferences}
+            preferencesLoading={preferencesLoading}
+            preferencesError={preferencesError}
+            onSavePreferences={saveUserPreferences}
+            aquariums={aquariums}
+            aquariumId={aquariumId}
+            aquariumName={aquariumName}
+            onSelectAquarium={selectAquarium}
+            settingsForm={settingsForm}
+            setSettingsForm={setSettingsForm}
+            saveAquariumSettings={saveSettings}
+            settingsSaving={settingsSaving}
+            settingsMessage={settingsMessage}
+            onSignOut={() => setShowSignOutConfirm(true)}
+            onDeleteAccount={async () => {
+              try { await supabase.auth.signOut({ scope: 'local' }); } catch {}
+              window.location.replace('/');
+            }}
+            unitLabel={tempUnit}
+            previewTheme={previewTheme}
+            notificationPermission={notificationPermission}
+            onEnableBrowserNotifications={enableNotifications}
+          />}
 
           {activeNav === 'Sensor Readings' && (
             <section className="panel">
@@ -1611,8 +1794,8 @@ function Dashboard({ user, onSignOut, appInstalled, onInstallApp }) {
                       const ok = t >= limits.temp_min && t <= limits.temp_max && p >= limits.ph_min && p <= limits.ph_max;
                       return (
                         <tr key={r.id}>
-                          <td><span className="time-cell"><Clock3 size={13} /> {fmtDateTime(r.created_at)}</span></td>
-                          <td>{t != null ? `${t.toFixed(1)} °C` : '–'}</td>
+                          <td><span className="time-cell"><Clock3 size={13} /> {formatTimestamp(r.created_at)}</span></td>
+                          <td>{t != null ? `${(fahrenheit ? t * 9 / 5 + 32 : t).toFixed(1)} ${tempUnit}` : '–'}</td>
                           <td>{p != null ? p.toFixed(2) : '–'}</td>
                           <td><span className="source-chip">{r.source || 'telemetry'}</span></td>
                           <td><StatusPill tone={ok ? 'good' : 'warning'}>{ok ? 'Normal' : 'Out of range'}</StatusPill></td>
@@ -1630,7 +1813,7 @@ function Dashboard({ user, onSignOut, appInstalled, onInstallApp }) {
               <div className="module-toolbar"><div className="module-controls"><select value={alertFilter} onChange={event => setAlertFilter(event.target.value)} aria-label="Filter alert status"><option value="active">Active</option><option value="acknowledged">Acknowledged</option><option value="resolved">Resolved</option><option value="all">All history</option></select><select value={severityFilter} onChange={event => setSeverityFilter(event.target.value)} aria-label="Filter severity"><option value="all">All severity</option><option value="critical">Critical</option><option value="warning">Warning</option></select><button className="secondary-button" onClick={loadModuleData} disabled={moduleBusy}><RefreshCw size={15} className={moduleBusy ? 'spin' : ''}/> Refresh alerts</button></div><button className="refresh-button" onClick={fetchReadings} disabled={loading}><RefreshCw size={14} className={loading ? 'spin' : ''} />{loading ? 'Syncing...' : 'Sync Data'}</button></div>
               {moduleBusy && <div className="module-loading"><LoaderCircle className="spin" size={18}/> Loading alert history...</div>}
               <div className="alert-list module-alert-list">
-                {visibleAlerts.length === 0 ? <div className="module-empty"><CheckCircle2 size={24}/><strong>{savedAlerts.length ? 'No alerts match these filters' : 'No recorded anomalies'}</strong><span>New threshold and device events will appear here automatically.</span></div> : visibleAlerts.map(alert => <article key={alert.id} className={`alert-item alert-severity-${alert.severity}`}><div className="alert-item-icon"><AlertTriangle size={18}/></div><div className="alert-item-copy"><div className="alert-item-title"><strong>{alert.alert_type.replaceAll('_', ' ').toUpperCase()} – {alert.severity}</strong><span>{fmtDateTime(alert.last_seen_at || alert.created_at)}</span></div><p>{alert.message}</p><small>First seen {fmtDateTime(alert.first_seen_at || alert.created_at)}{alert.status !== 'active' ? ` – ${alert.status}` : ''}</small></div><div className="alert-actions">{alert.status === 'active' && <button className="secondary-button" onClick={() => updateAlertStatus(alert.id, 'acknowledged')}>Acknowledge</button>}{alert.status !== 'resolved' && <button className="primary-button" onClick={() => updateAlertStatus(alert.id, 'resolved')}><Check size={14}/> Resolve</button>}{alert.status === 'resolved' && <button className="secondary-button" onClick={() => updateAlertStatus(alert.id, 'active')}><RotateCcw size={14}/> Reopen</button>}</div></article>)}
+                {visibleAlerts.length === 0 ? <div className="module-empty"><CheckCircle2 size={24}/><strong>{savedAlerts.length ? 'No alerts match these filters' : 'No recorded anomalies'}</strong><span>New threshold and device events will appear here automatically.</span></div> : visibleAlerts.map(alert => <article key={alert.id} className={`alert-item alert-severity-${alert.severity}`}><div className="alert-item-icon"><AlertTriangle size={18}/></div><div className="alert-item-copy"><div className="alert-item-title"><strong>{alert.alert_type.replaceAll('_', ' ').toUpperCase()} – {alert.severity}</strong><span>{formatTimestamp(alert.last_seen_at || alert.created_at)}</span></div><p>{alert.message}</p><small>First seen {formatTimestamp(alert.first_seen_at || alert.created_at)}{alert.status !== 'active' ? ` – ${alert.status}` : ''}</small></div><div className="alert-actions">{alert.status === 'active' && <button className="secondary-button" onClick={() => updateAlertStatus(alert.id, 'acknowledged')}>Acknowledge</button>}{alert.status !== 'resolved' && <button className="primary-button" onClick={() => updateAlertStatus(alert.id, 'resolved')}><Check size={14}/> Resolve</button>}{alert.status === 'resolved' && <button className="secondary-button" onClick={() => updateAlertStatus(alert.id, 'active')}><RotateCcw size={14}/> Reopen</button>}</div></article>)}
               </div>
             </section>
           )}
@@ -1709,13 +1892,13 @@ function Dashboard({ user, onSignOut, appInstalled, onInstallApp }) {
                 <div className="report-history-tabs" role="tablist" aria-label="Report history">
                   {[['latest', 'Latest'], ['all', 'All reports'], ['deleted', 'Deleted']].map(([filter, label]) => <button key={filter} role="tab" aria-selected={reportFilter === filter} className={reportFilter === filter ? 'active' : ''} onClick={() => setReportFilter(filter)}>{label}<span>{filter === 'deleted' ? reportRows.filter(report => report.deleted_at).length : filter === 'latest' ? Math.min(5, reportRows.filter(report => !report.deleted_at).length) : reportRows.filter(report => !report.deleted_at).length}</span></button>)}
                 </div>
-                {visibleReports.length ? visibleReports.map(report => <article className={`report-card ${selectedReport?.id === report.id ? 'selected' : ''}`} key={report.id} onClick={() => setSelectedReport(report)}><div><FileSpreadsheet size={18}/><strong>{report.title}</strong>{report.deleted_at && <span className="report-status deleted">Deleted</span>}</div><span>{fmtDateTime(report.created_at)} – {report.reading_count} readings</span><div className="report-card-actions"><button className="secondary-button" onClick={event => { event.stopPropagation(); downloadHealthReport(report); }}><Download size={14}/> Download CSV</button>{report.deleted_at ? <button className="secondary-button" onClick={event => { event.stopPropagation(); restoreHealthReport(report.id); }}><RotateCcw size={14}/> Restore</button> : <button className="icon-button" aria-label="Move report to deleted" title="Move to deleted" onClick={event => { event.stopPropagation(); deleteHealthReport(report.id); }}><Trash2 size={15}/></button>}</div></article>) : <div className="module-empty">{reportFilter === 'deleted' ? 'No deleted reports.' : 'No reports yet. Generate one to save a report here.'}</div>}
+                {visibleReports.length ? visibleReports.map(report => <article className={`report-card ${selectedReport?.id === report.id ? 'selected' : ''}`} key={report.id} onClick={() => setSelectedReport(report)}><div><FileSpreadsheet size={18}/><strong>{report.title}</strong>{report.deleted_at && <span className="report-status deleted">Deleted</span>}</div><span>{formatTimestamp(report.created_at)} – {report.reading_count} readings</span><div className="report-card-actions"><button className="secondary-button" onClick={event => { event.stopPropagation(); downloadHealthReport(report); }}><Download size={14}/> Download CSV</button>{report.deleted_at ? <button className="secondary-button" onClick={event => { event.stopPropagation(); restoreHealthReport(report.id); }}><RotateCcw size={14}/> Restore</button> : <button className="icon-button" aria-label="Move report to deleted" title="Move to deleted" onClick={event => { event.stopPropagation(); deleteHealthReport(report.id); }}><Trash2 size={15}/></button>}</div></article>) : <div className="module-empty">{reportFilter === 'deleted' ? 'No deleted reports.' : 'No reports yet. Generate one to save a report here.'}</div>}
               </div>
-              {selectedReport ? <article className="report-detail"><div className="module-toolbar"><div><h2>{selectedReport.title}</h2><p>{fmtDateTime(selectedReport.period_start)} – {fmtDateTime(selectedReport.period_end)}</p>{selectedReport.deleted_at && <span className="report-status deleted">Deleted {fmtDateTime(selectedReport.deleted_at)}</span>}</div><div className="report-card-actions"><button className="secondary-button" onClick={() => downloadHealthReport(selectedReport, 'csv')}><Download size={15}/> CSV</button><button className="secondary-button" onClick={() => downloadHealthReport(selectedReport, 'xlsx')}><Download size={15}/> XLSX</button></div></div><div className="report-summary-grid"><div><small>Readings</small><strong>{selectedReport.reading_count}</strong></div><div><small>Temperature avg.</small><strong>{selectedReport.report_data?.summary?.temperature?.avg == null ? '–' : Number(selectedReport.report_data.summary.temperature.avg).toFixed(1) + ' °C'}</strong></div><div><small>pH avg.</small><strong>{selectedReport.report_data?.summary?.ph?.avg == null ? '–' : Number(selectedReport.report_data.summary.ph.avg).toFixed(2)}</strong></div></div><div className="report-readings-preview"><h3>Sensor readings ({selectedReport.reading_count})</h3>{selectedReport.report_data?.readings?.length ? <div className="table-wrap"><table><thead><tr><th>Recorded at</th><th>Temperature</th><th>pH</th><th>Source</th></tr></thead><tbody>{selectedReport.report_data.readings.slice(0, 50).map((reading, index) => <tr key={reading.id || index}><td>{fmtDateTime(reading.created_at)}</td><td>{reading.temperature == null ? '–' : `${reading.temperature} °C`}</td><td>{reading.ph_level == null ? '–' : Number(reading.ph_level).toFixed(2)}</td><td>{reading.source || '—'}</td></tr>)}</tbody></table></div> : <p>No sensor readings were recorded during this period.</p>}</div></article> : <article className="report-detail report-detail-empty"><div className="module-empty"><FileSpreadsheet size={24}/><strong>No report selected</strong><span>Generate a report or select one from the list to view its details.</span></div></article>}
+              {selectedReport ? <article className="report-detail"><div className="module-toolbar"><div><h2>{selectedReport.title}</h2><p>{formatTimestamp(selectedReport.period_start)} – {formatTimestamp(selectedReport.period_end)}</p>{selectedReport.deleted_at && <span className="report-status deleted">Deleted {formatTimestamp(selectedReport.deleted_at)}</span>}</div><div className="report-card-actions"><button className="secondary-button" onClick={() => downloadHealthReport(selectedReport, 'csv')}><Download size={15}/> CSV</button><button className="secondary-button" onClick={() => downloadHealthReport(selectedReport, 'xlsx')}><Download size={15}/> XLSX</button></div></div><div className="report-summary-grid"><div><small>Readings</small><strong>{selectedReport.reading_count}</strong></div><div><small>Temperature avg.</small><strong>{selectedReport.report_data?.summary?.temperature?.avg == null ? '–' : Number(selectedReport.report_data.summary.temperature.avg).toFixed(1) + ' °C'}</strong></div><div><small>pH avg.</small><strong>{selectedReport.report_data?.summary?.ph?.avg == null ? '–' : Number(selectedReport.report_data.summary.ph.avg).toFixed(2)}</strong></div></div><div className="report-readings-preview"><h3>Sensor readings ({selectedReport.reading_count})</h3>{selectedReport.report_data?.readings?.length ? <div className="table-wrap"><table><thead><tr><th>Recorded at</th><th>Temperature</th><th>pH</th><th>Source</th></tr></thead><tbody>{selectedReport.report_data.readings.slice(0, 50).map((reading, index) => <tr key={reading.id || index}><td>{formatTimestamp(reading.created_at)}</td><td>{reading.temperature == null ? '–' : `${reading.temperature} °C`}</td><td>{reading.ph_level == null ? '–' : Number(reading.ph_level).toFixed(2)}</td><td>{reading.source || '—'}</td></tr>)}</tbody></table></div> : <p>No sensor readings were recorded during this period.</p>}</div></article> : <article className="report-detail report-detail-empty"><div className="module-empty"><FileSpreadsheet size={24}/><strong>No report selected</strong><span>Generate a report or select one from the list to view its details.</span></div></article>}
             </div>
           </section>}
 
-          {activeNav === 'Care Planner' && <section className="module-page"><div className="module-toolbar care-planner-toolbar"><button className="secondary-button" onClick={() => setTaskHistory(value => !value)}>{taskHistory ? 'Show upcoming' : 'Task history'}</button><button className="refresh-button" onClick={fetchReadings} disabled={loading}><RefreshCw size={14} className={loading ? 'spin' : ''} />{loading ? 'Syncing...' : 'Sync Data'}</button></div><div className="care-layout"><article className="care-calendar panel"><div className="calendar-heading"><button className="icon-button" aria-label="Previous month" onClick={() => setTaskMonth(date => new Date(date.getFullYear(), date.getMonth() - 1, 1))}><ChevronLeft size={17}/></button><h2>{taskMonth.toLocaleDateString([], { month: 'long', year: 'numeric' })}</h2><button className="icon-button" aria-label="Next month" onClick={() => setTaskMonth(date => new Date(date.getFullYear(), date.getMonth() + 1, 1))}><ChevronRight size={17}/></button></div><div className="care-calendar-grid">{['Sun','Mon','Tue','Wed','Thu','Fri','Sat'].map(day => <span className="calendar-weekday" key={day}>{day}</span>)}{careCalendarCells.map((day,index) => { const date = day ? new Date(taskMonth.getFullYear(), taskMonth.getMonth(), day).toLocaleDateString('en-CA') : ''; const count = monthTasks.filter(task => new Date(task.due_at).getDate() === day).length; return day ? <button key={date} className={`care-calendar-day ${selectedTaskDate === date ? 'selected' : ''}`} onClick={() => setSelectedTaskDate(date)}>{day}{count > 0 && <i>{count}</i>}</button> : <span key={`empty-${index}`}/>; })}</div><div className="calendar-selected">Tasks on {new Date(`${selectedTaskDate}T12:00:00`).toLocaleDateString([], { month: 'short', day: 'numeric' })}<div>{monthTasks.filter(task => new Date(task.due_at).toLocaleDateString('en-CA') === selectedTaskDate).map(task => <span key={task.id}>{task.title}</span>)}{!monthTasks.some(task => new Date(task.due_at).toLocaleDateString('en-CA') === selectedTaskDate) && <small>No tasks scheduled</small>}</div></div></article><div className="care-workspace"><form className="care-task-form panel" onSubmit={createCareTask}><h2>Add care reminder</h2><label>Task name<input required value={taskForm.title} onChange={event => setTaskForm(form => ({...form,title:event.target.value}))} placeholder="e.g. Feed the fish"/></label><div className="module-controls"><label>Type<select value={taskForm.task_type} onChange={event => setTaskForm(form => ({...form,task_type:event.target.value}))}><option value="feeding">Feeding</option><option value="maintenance">Water change / filter</option><option value="water_test">Water testing</option><option value="other">Other</option></select></label><label>Repeat<select value={taskForm.recurrence} onChange={event => setTaskForm(form => ({...form,recurrence:event.target.value}))}><option value="none">Does not repeat</option><option value="daily">Daily</option><option value="weekly">Weekly</option><option value="monthly">Monthly</option></select></label></div><label>Due date<input type="datetime-local" required value={taskForm.due_at} onChange={event => setTaskForm(form => ({...form,due_at:event.target.value}))}/></label><label>Notes<textarea rows="2" value={taskForm.notes} onChange={event => setTaskForm(form => ({...form,notes:event.target.value}))} placeholder="Optional details"/></label><button className="primary-button" type="submit"><CalendarCheck2 size={15}/> Add reminder</button></form><div className="care-task-list"><h2>{taskHistory ? 'Completed task history' : 'Upcoming care tasks'}</h2>{visibleCareTasks.length ? visibleCareTasks.map(task => <article className="care-task-card panel" key={task.id}><div className="care-task-icon"><CalendarDays size={17}/></div><div className="care-task-copy"><strong>{task.title}</strong><span>{task.task_type.replaceAll('_',' ')} – {fmtDateTime(task.due_at)} – {task.recurrence === 'none' ? 'One-time' : `Repeats ${task.recurrence}`}</span>{task.notes && <small>{task.notes}</small>}</div><div className="care-task-actions">{task.status === 'pending' && <><button className="secondary-button" onClick={() => changeCareTaskStatus(task,'completed')}><Check size={14}/> Done</button><button className="icon-button" title="Skip task" onClick={() => changeCareTaskStatus(task,'skipped')}><RotateCcw size={14}/></button></>}<button className="icon-button" title="Delete task" onClick={() => deleteCareTask(task.id)}><Trash2 size={14}/></button></div></article>) : <div className="module-empty">{taskHistory ? 'No completed or skipped tasks yet.' : 'No upcoming tasks. Add a reminder to get started.'}</div>}</div></div></div></section>}
+          {activeNav === 'Care Planner' && <section className="module-page"><div className="module-toolbar care-planner-toolbar"><button className="secondary-button" onClick={() => setTaskHistory(value => !value)}>{taskHistory ? 'Show upcoming' : 'Task history'}</button><button className="refresh-button" onClick={fetchReadings} disabled={loading}><RefreshCw size={14} className={loading ? 'spin' : ''} />{loading ? 'Syncing...' : 'Sync Data'}</button></div><div className="care-layout"><article className="care-calendar panel"><div className="calendar-heading"><button className="icon-button" aria-label="Previous month" onClick={() => setTaskMonth(date => new Date(date.getFullYear(), date.getMonth() - 1, 1))}><ChevronLeft size={17}/></button><h2>{taskMonth.toLocaleDateString([], { month: 'long', year: 'numeric' })}</h2><button className="icon-button" aria-label="Next month" onClick={() => setTaskMonth(date => new Date(date.getFullYear(), date.getMonth() + 1, 1))}><ChevronRight size={17}/></button></div><div className="care-calendar-grid">{['Sun','Mon','Tue','Wed','Thu','Fri','Sat'].map(day => <span className="calendar-weekday" key={day}>{day}</span>)}{careCalendarCells.map((day,index) => { const date = day ? new Date(taskMonth.getFullYear(), taskMonth.getMonth(), day).toLocaleDateString('en-CA') : ''; const count = monthTasks.filter(task => new Date(task.due_at).getDate() === day).length; return day ? <button key={date} className={`care-calendar-day ${selectedTaskDate === date ? 'selected' : ''}`} onClick={() => setSelectedTaskDate(date)}>{day}{count > 0 && <i>{count}</i>}</button> : <span key={`empty-${index}`}/>; })}</div><div className="calendar-selected">Tasks on {new Date(`${selectedTaskDate}T12:00:00`).toLocaleDateString([], { month: 'short', day: 'numeric' })}<div>{monthTasks.filter(task => new Date(task.due_at).toLocaleDateString('en-CA') === selectedTaskDate).map(task => <span key={task.id}>{task.title}</span>)}{!monthTasks.some(task => new Date(task.due_at).toLocaleDateString('en-CA') === selectedTaskDate) && <small>No tasks scheduled</small>}</div></div></article><div className="care-workspace"><form className="care-task-form panel" onSubmit={createCareTask}><h2>Add care reminder</h2><label>Task name<input required value={taskForm.title} onChange={event => setTaskForm(form => ({...form,title:event.target.value}))} placeholder="e.g. Feed the fish"/></label><div className="module-controls"><label>Type<select value={taskForm.task_type} onChange={event => setTaskForm(form => ({...form,task_type:event.target.value}))}><option value="feeding">Feeding</option><option value="maintenance">Water change / filter</option><option value="water_test">Water testing</option><option value="other">Other</option></select></label><label>Repeat<select value={taskForm.recurrence} onChange={event => setTaskForm(form => ({...form,recurrence:event.target.value}))}><option value="none">Does not repeat</option><option value="daily">Daily</option><option value="weekly">Weekly</option><option value="monthly">Monthly</option></select></label></div><label>Due date<input type="datetime-local" required value={taskForm.due_at} onChange={event => setTaskForm(form => ({...form,due_at:event.target.value}))}/></label><label>Notes<textarea rows="2" value={taskForm.notes} onChange={event => setTaskForm(form => ({...form,notes:event.target.value}))} placeholder="Optional details"/></label><button className="primary-button" type="submit"><CalendarCheck2 size={15}/> Add reminder</button></form><div className="care-task-list"><h2>{taskHistory ? 'Completed task history' : 'Upcoming care tasks'}</h2>{visibleCareTasks.length ? visibleCareTasks.map(task => <article className="care-task-card panel" key={task.id}><div className="care-task-icon"><CalendarDays size={17}/></div><div className="care-task-copy"><strong>{task.title}</strong><span>{task.task_type.replaceAll('_',' ')} – {formatTimestamp(task.due_at)} – {task.recurrence === 'none' ? 'One-time' : `Repeats ${task.recurrence}`}</span>{task.notes && <small>{task.notes}</small>}</div><div className="care-task-actions">{task.status === 'pending' && <><button className="secondary-button" onClick={() => changeCareTaskStatus(task,'completed')}><Check size={14}/> Done</button><button className="icon-button" title="Skip task" onClick={() => changeCareTaskStatus(task,'skipped')}><RotateCcw size={14}/></button></>}<button className="icon-button" title="Delete task" onClick={() => deleteCareTask(task.id)}><Trash2 size={14}/></button></div></article>) : <div className="module-empty">{taskHistory ? 'No completed or skipped tasks yet.' : 'No upcoming tasks. Add a reminder to get started.'}</div>}</div></div></div></section>}
         </div>
       </main>
       {showSignOutConfirm && (

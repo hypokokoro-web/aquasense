@@ -54,13 +54,20 @@ Deno.serve(async request => {
   // Published notices are the only operation available to signed-in regular
   // accounts. All management and diagnostics require the allowlist + password.
   if (body.action === 'list_announcements') {
-    const { data, error } = await service.from('aquasense_announcements')
+    const [{ data, error }, { data: platformSettings, error: settingsError }] = await Promise.all([
+      service.from('aquasense_announcements')
       .select('id,title,message,category,publish_at,expires_at,updated_at')
       .eq('status', 'published').or(`publish_at.is.null,publish_at.lte.${new Date().toISOString()}`)
       .or(`expires_at.is.null,expires_at.gt.${new Date().toISOString()}`)
-      .order('publish_at', { ascending: false }).limit(20);
-    if (error) return json({ error: 'Could not load announcements.' }, 500);
-    return json({ announcements: data || [] });
+      .order('publish_at', { ascending: false }).limit(20),
+      service.from('aquasense_platform_settings').select('setting_key,setting_value').in('setting_key', ['maintenance_mode_enabled', 'maintenance_mode_message']),
+    ]);
+    if (error || settingsError) return json({ error: 'Could not load platform notices.' }, 503);
+    const settings = Object.fromEntries((platformSettings || []).map(row => [row.setting_key, row.setting_value]));
+    return json({ announcements: data || [], maintenance: {
+      enabled: settings.maintenance_mode_enabled === true,
+      message: typeof settings.maintenance_mode_message === 'string' ? settings.maintenance_mode_message : 'AquaSense is undergoing scheduled maintenance. Some features may be temporarily unavailable.',
+    } });
   }
   if (!admin) return json({ error: 'Administrator access is required.' }, 403);
   if (!hasPasswordAuthMethod(token)) return json({ error: 'Administrator sign-in requires email and password.' }, 403);
@@ -79,6 +86,7 @@ Deno.serve(async request => {
     const normalizedAccounts = accounts.map(account => ({
       id: account.id,
       email: account.email || null,
+      email_verified: Boolean(account.email_confirmed_at),
       name: account.user_metadata?.full_name || account.user_metadata?.name || null,
       created_at: account.created_at,
       last_sign_in_at: account.last_sign_in_at || null,
@@ -97,38 +105,6 @@ Deno.serve(async request => {
     const requestedPage = Number(body.page ?? 1);
     const accountPage = Number.isSafeInteger(requestedPage) ? Math.max(1, Math.min(requestedPage, 100000)) : 1;
     return json({ users: filtered.slice((accountPage - 1) * 25, accountPage * 25), total: filtered.length, page: accountPage, page_size: 25 });
-  }
-
-  if (body.action === 'set_admin') {
-    if (typeof body.user_id !== 'string' || !UUID.test(body.user_id) || typeof body.is_admin !== 'boolean') {
-      return json({ error: 'Provide a valid account ID and administrator state.' }, 400);
-    }
-    const { data: target, error: targetError } = await service.auth.admin.getUserById(body.user_id);
-    if (targetError || !target.user) return json({ error: 'Account not found.' }, 404);
-    if (!body.is_admin && body.user_id === user.id) {
-      await writeAudit(service, user.id, { action: 'role_change', entity_type: 'user', entity_id: body.user_id, outcome: 'failure', metadata: { reason: 'self_change_blocked' } });
-      return json({ error: 'You cannot remove your own administrator access.' }, 409);
-    }
-    if (!body.is_admin) {
-      const { data: removed, error } = await service.rpc('remove_aquasense_admin', { target_user_id: body.user_id });
-      if (error) {
-        await writeAudit(service, user.id, { action: 'role_change', entity_type: 'user', entity_id: body.user_id, outcome: 'failure', metadata: { reason: 'removal_failed' } });
-        return json({ error: 'Could not safely remove administrator access.' }, 500);
-      }
-      if (!removed) {
-        await writeAudit(service, user.id, { action: 'role_change', entity_type: 'user', entity_id: body.user_id, outcome: 'failure', metadata: { reason: 'final_admin_guard' } });
-        return json({ error: 'The final administrator cannot be removed.' }, 409);
-      }
-    }
-    if (body.is_admin) {
-      const { error } = await service.from('aquasense_admins').upsert({ user_id: body.user_id }, { onConflict: 'user_id' });
-      if (error) {
-        await writeAudit(service, user.id, { action: 'role_change', entity_type: 'user', entity_id: body.user_id, outcome: 'failure', metadata: { role: 'admin' } });
-        return json({ error: 'Could not grant administrator access.' }, 500);
-      }
-    }
-    await writeAudit(service, user.id, { action: 'role_change', entity_type: 'user', entity_id: body.user_id, outcome: 'success', metadata: { role: body.is_admin ? 'admin' : 'user' } });
-    return json({ ok: true });
   }
 
   if (body.action === 'set_user_suspended') {
@@ -156,6 +132,21 @@ Deno.serve(async request => {
     return json({ ok: true });
   }
 
+  if (body.action === 'revoke_user_sessions') {
+    if (typeof body.user_id !== 'string' || !UUID.test(body.user_id)) return json({ error: 'Provide a valid account ID.' }, 400);
+    if (body.user_id === user.id) return json({ error: 'You cannot revoke your current administrator session.' }, 409);
+    const { data: target, error: targetError } = await service.auth.admin.getUserById(body.user_id);
+    if (targetError || !target.user) return json({ error: 'Account not found.' }, 404);
+    const { data: revokedCount, error } = await service.rpc('revoke_aquasense_user_sessions', { target_user_id: body.user_id });
+    if (error) {
+      await writeAudit(service, user.id, { action: 'sessions_revoked', entity_type: 'user', entity_id: body.user_id, outcome: 'failure' });
+      console.error('Admin session revocation failed.', { code: error.code || 'unknown' });
+      return json({ error: 'Could not revoke account sessions. Apply the account session migration first.' }, 503);
+    }
+    await writeAudit(service, user.id, { action: 'sessions_revoked', entity_type: 'user', entity_id: body.user_id, outcome: 'success', metadata: { refresh_sessions_revoked: revokedCount || 0 } });
+    return json({ ok: true, revoked_sessions: revokedCount || 0 });
+  }
+
   if (body.action === 'list_audit_logs') {
     const requestedLimit = Number(body.limit ?? 50);
     const limit = Number.isInteger(requestedLimit) ? Math.max(1, Math.min(requestedLimit, 100)) : 50;
@@ -174,11 +165,12 @@ Deno.serve(async request => {
   }
 
   if (body.action === 'list_operations') {
-    const [devices, events] = await Promise.all([
+    const [devices, events, offlineTimeoutSetting] = await Promise.all([
       service.from('aquasense_devices').select('device_id,aquarium_id,is_active,last_request_at,last_seen_at').order('last_seen_at', { ascending: false, nullsFirst: false }).limit(100),
       service.from('aquasense_ingest_events').select('id,device_id,aquarium_id,event_code,outcome,created_at').order('created_at', { ascending: false }).limit(100),
+      service.from('aquasense_platform_settings').select('setting_value').eq('setting_key', 'device_offline_timeout_seconds').maybeSingle(),
     ]);
-    if (devices.error || events.error) return json({ error: 'Could not load system diagnostics. Apply the platform management migration first.' }, 503);
+    if (devices.error || events.error || offlineTimeoutSetting.error) return json({ error: 'Could not load system diagnostics. Apply the platform management migration first.' }, 503);
     const deviceIds = (devices.data || []).map(device => device.device_id);
     const readingBatches = await Promise.all(Array.from({ length: Math.ceil(deviceIds.length / 20) }, (_, index) =>
       service.from('sensor_readings').select('device_id,created_at').in('device_id', deviceIds.slice(index * 20, index * 20 + 20)).order('created_at', { ascending: false }).limit(1000)
@@ -186,35 +178,25 @@ Deno.serve(async request => {
     if (readingBatches.some(batch => batch.error)) return json({ error: 'Could not load recent accepted readings.' }, 503);
     const latestByDevice = new Map();
     for (const batch of readingBatches) for (const reading of batch.data || []) if (!latestByDevice.has(reading.device_id)) latestByDevice.set(reading.device_id, reading.created_at);
-    return json({ devices: (devices.data || []).map(device => ({ ...device, last_reading_at: latestByDevice.get(device.device_id) || null })), events: events.data || [] });
+    const configuredTimeout = Number(offlineTimeoutSetting.data?.setting_value ?? 300);
+    const offlineTimeoutSeconds = Number.isInteger(configuredTimeout) && configuredTimeout >= 30 && configuredTimeout <= 86400 ? configuredTimeout : 300;
+    return json({ devices: (devices.data || []).map(device => ({ ...device, last_reading_at: latestByDevice.get(device.device_id) || null })), events: events.data || [], offline_timeout_seconds: offlineTimeoutSeconds });
   }
 
-  if (body.action === 'get_platform_report') {
-    const requestedDays = Number(body.days ?? 30);
-    const reportDays = [7, 30, 90, 365].includes(requestedDays) ? requestedDays : 30;
-    const [aquariumCount, deviceCount, publishedContent, draftContent, auditCount] = await Promise.all([
-      service.from('aquariums').select('id', { count: 'exact', head: true }),
-      service.from('aquasense_devices').select('device_id', { count: 'exact', head: true }),
-      service.from('aquasense_knowledge_chunks').select('id', { count: 'exact', head: true }).eq('is_published', true).eq('is_archived', false),
-      service.from('aquasense_knowledge_chunks').select('id', { count: 'exact', head: true }).eq('is_published', false).eq('is_archived', false),
-      service.from('aquasense_audit_logs').select('id', { count: 'exact', head: true }),
-    ]);
-    if (aquariumCount.error || deviceCount.error || publishedContent.error || draftContent.error || auditCount.error) return json({ error: 'Could not calculate platform reports.' }, 500);
-    let totalUsers = 0, newUsersInWindow = 0;
-    for (let page = 1; page <= 100; page += 1) {
-      const { data, error } = await service.auth.admin.listUsers({ page, perPage: 1000 });
-      if (error) return json({ error: 'Could not calculate account reports.' }, 500);
-      totalUsers += data.users.length;
-      const threshold = Date.now() - reportDays * 24 * 60 * 60 * 1000;
-      newUsersInWindow += data.users.filter(account => Date.parse(account.created_at) >= threshold).length;
-      if (data.users.length < 1000) break;
+  if (body.action === 'create_aquarium') {
+    const name = typeof body.name === 'string' ? body.name.trim() : '';
+    if (!name || name.length > 120) return json({ error: 'Enter an aquarium name with at most 120 characters.' }, 400);
+    const { data: aquarium, error } = await service.from('aquariums')
+      .insert({ name })
+      .select('id,name,owner_id,created_at')
+      .single();
+    if (error) {
+      await writeAudit(service, user.id, { action: 'aquarium_create', entity_type: 'aquarium', outcome: 'failure', metadata: { name } });
+      console.error('Admin aquarium creation failed.', { code: error.code || 'unknown' });
+      return json({ error: 'Could not create the aquarium. Check the aquarium schema and try again.' }, 500);
     }
-    return json({ generated_at: new Date().toISOString(), metrics: {
-      total_users: totalUsers, new_users_in_window: newUsersInWindow, registration_window_days: reportDays,
-      total_aquariums: aquariumCount.count || 0, registered_devices: deviceCount.count || 0,
-      published_content: publishedContent.count || 0, draft_content: draftContent.count || 0,
-      admin_actions: auditCount.count || 0,
-    } });
+    await writeAudit(service, user.id, { action: 'aquarium_create', entity_type: 'aquarium', entity_id: String(aquarium.id), outcome: 'success', metadata: { name: aquarium.name, owner_assigned: false } });
+    return json({ aquarium });
   }
 
   if (body.action === 'list_content') {
@@ -268,10 +250,21 @@ Deno.serve(async request => {
     const message = typeof body.message === 'string' ? body.message.trim() : '';
     const category = body.category;
     const status = body.status;
-    const publishAt = validIsoOrNull(body.publish_at), expiresAt = validIsoOrNull(body.expires_at);
-    if (title.length < 1 || title.length > 160 || message.length < 1 || message.length > 5000 || !ANNOUNCEMENT_CATEGORIES.includes(category as any) || !['draft', 'published', 'archived'].includes(String(status)) || publishAt === undefined || expiresAt === undefined || (publishAt && expiresAt && Date.parse(expiresAt) <= Date.parse(publishAt))) {
+    const publishAt = validIsoOrNull(body.publish_at);
+    let expiresAt = validIsoOrNull(body.expires_at);
+    if (title.length < 1 || title.length > 160 || message.length < 1 || message.length > 5000 || !ANNOUNCEMENT_CATEGORIES.includes(category as any) || !['draft', 'published', 'archived'].includes(String(status)) || publishAt === undefined || expiresAt === undefined) {
       return json({ error: 'Check the title, message, category, status, and publication dates.' }, 400);
     }
+    if (status === 'published' && expiresAt === null) {
+      const { data: visibilitySetting, error: visibilityError } = await service.from('aquasense_platform_settings')
+        .select('setting_value').eq('setting_key', 'announcement_visibility_days').maybeSingle();
+      if (visibilityError) return json({ error: 'Could not load the announcement visibility setting.' }, 503);
+      const visibilityDays = Number(visibilitySetting?.setting_value ?? 7);
+      if (!Number.isInteger(visibilityDays) || visibilityDays < 1 || visibilityDays > 365) return json({ error: 'The announcement visibility setting is invalid.' }, 503);
+      const visibilityStartsAt = publishAt ? Date.parse(publishAt) : Date.now();
+      expiresAt = new Date(visibilityStartsAt + visibilityDays * 24 * 60 * 60 * 1000).toISOString();
+    }
+    if (publishAt && expiresAt && Date.parse(expiresAt) <= Date.parse(publishAt)) return json({ error: 'The expiration date must be later than the publication date.' }, 400);
     const patch = { title, message, category, status, publish_at: publishAt, expires_at: expiresAt, updated_by: user.id, updated_at: new Date().toISOString() };
     const id = typeof body.id === 'string' && UUID.test(body.id) ? body.id : null;
     const result = id
@@ -289,24 +282,62 @@ Deno.serve(async request => {
     const { data, error } = await service.from('aquasense_platform_settings').select('setting_key,setting_value,updated_at');
     if (error) return json({ error: 'Could not load platform settings.' }, 503);
     const settings = Object.fromEntries((data || []).map(row => [row.setting_key, row.setting_value]));
-    return json({ settings: { default_announcement_category: settings.default_announcement_category || 'general', platform_timezone: settings.platform_timezone || 'UTC' } });
+    return json({ settings: {
+      default_announcement_category: settings.default_announcement_category || 'general',
+      platform_timezone: settings.platform_timezone || 'UTC',
+      announcement_visibility_days: Number(settings.announcement_visibility_days ?? 7),
+      device_offline_timeout_seconds: Number(settings.device_offline_timeout_seconds ?? 300),
+      maintenance_mode_enabled: settings.maintenance_mode_enabled === true,
+      maintenance_mode_message: typeof settings.maintenance_mode_message === 'string' ? settings.maintenance_mode_message : 'AquaSense is undergoing scheduled maintenance. Some features may be temporarily unavailable.',
+      esp32_minimum_interval_ms: Number(settings.esp32_minimum_interval_ms ?? 1000),
+      esp32_temperature_min: Number(settings.esp32_temperature_min ?? 0),
+      esp32_temperature_max: Number(settings.esp32_temperature_max ?? 50),
+      esp32_ph_min: Number(settings.esp32_ph_min ?? 0),
+      esp32_ph_max: Number(settings.esp32_ph_max ?? 14),
+    } });
   }
 
   if (body.action === 'save_platform_settings') {
     const category = body.default_announcement_category;
     const timezone = body.platform_timezone;
+    const announcementVisibilityDays = Number(body.announcement_visibility_days);
+    const deviceOfflineTimeoutSeconds = Number(body.device_offline_timeout_seconds);
+    const maintenanceEnabled = body.maintenance_mode_enabled;
+    const maintenanceMessage = typeof body.maintenance_mode_message === 'string' ? body.maintenance_mode_message.trim() : '';
+    const minimumIntervalMs = Number(body.esp32_minimum_interval_ms);
+    const temperatureMin = Number(body.esp32_temperature_min);
+    const temperatureMax = Number(body.esp32_temperature_max);
+    const phMin = Number(body.esp32_ph_min);
+    const phMax = Number(body.esp32_ph_max);
     const allowedZones = ['UTC', 'Asia/Manila', 'Asia/Singapore', 'America/Los_Angeles', 'America/New_York', 'Europe/London'];
-    if (!ANNOUNCEMENT_CATEGORIES.includes(category as any) || typeof timezone !== 'string' || !allowedZones.includes(timezone)) return json({ error: 'Choose a supported announcement category and platform timezone.' }, 400);
+    if (!ANNOUNCEMENT_CATEGORIES.includes(category as any) || typeof timezone !== 'string' || !allowedZones.includes(timezone) ||
+      !Number.isInteger(announcementVisibilityDays) || announcementVisibilityDays < 1 || announcementVisibilityDays > 365 ||
+      !Number.isInteger(deviceOfflineTimeoutSeconds) || deviceOfflineTimeoutSeconds < 30 || deviceOfflineTimeoutSeconds > 86400 ||
+      typeof maintenanceEnabled !== 'boolean' || !maintenanceMessage || maintenanceMessage.length > 500 ||
+      !Number.isInteger(minimumIntervalMs) || minimumIntervalMs < 100 || minimumIntervalMs > 60000 ||
+      !Number.isFinite(temperatureMin) || !Number.isFinite(temperatureMax) || temperatureMin < 0 || temperatureMax > 50 || temperatureMin >= temperatureMax ||
+      !Number.isFinite(phMin) || !Number.isFinite(phMax) || phMin < 0 || phMax > 14 || phMin >= phMax) {
+      return json({ error: 'Check the maintenance message, ESP32 interval, and sensor ranges.' }, 400);
+    }
     const now = new Date().toISOString();
     const { error } = await service.from('aquasense_platform_settings').upsert([
       { setting_key: 'default_announcement_category', setting_value: category, updated_by: user.id, updated_at: now },
       { setting_key: 'platform_timezone', setting_value: timezone, updated_by: user.id, updated_at: now },
+      { setting_key: 'announcement_visibility_days', setting_value: announcementVisibilityDays, updated_by: user.id, updated_at: now },
+      { setting_key: 'device_offline_timeout_seconds', setting_value: deviceOfflineTimeoutSeconds, updated_by: user.id, updated_at: now },
+      { setting_key: 'maintenance_mode_enabled', setting_value: maintenanceEnabled, updated_by: user.id, updated_at: now },
+      { setting_key: 'maintenance_mode_message', setting_value: maintenanceMessage, updated_by: user.id, updated_at: now },
+      { setting_key: 'esp32_minimum_interval_ms', setting_value: minimumIntervalMs, updated_by: user.id, updated_at: now },
+      { setting_key: 'esp32_temperature_min', setting_value: temperatureMin, updated_by: user.id, updated_at: now },
+      { setting_key: 'esp32_temperature_max', setting_value: temperatureMax, updated_by: user.id, updated_at: now },
+      { setting_key: 'esp32_ph_min', setting_value: phMin, updated_by: user.id, updated_at: now },
+      { setting_key: 'esp32_ph_max', setting_value: phMax, updated_by: user.id, updated_at: now },
     ], { onConflict: 'setting_key' });
     if (error) {
       await writeAudit(service, user.id, { action: 'settings_update', entity_type: 'platform_settings', outcome: 'failure' });
       return json({ error: 'Could not save platform settings.' }, 500);
     }
-    await writeAudit(service, user.id, { action: 'settings_update', entity_type: 'platform_settings', outcome: 'success', metadata: { default_announcement_category: category, platform_timezone: timezone } });
+    await writeAudit(service, user.id, { action: 'settings_update', entity_type: 'platform_settings', outcome: 'success', metadata: { default_announcement_category: category, platform_timezone: timezone, announcement_visibility_days: announcementVisibilityDays, device_offline_timeout_seconds: deviceOfflineTimeoutSeconds, maintenance_mode_enabled: maintenanceEnabled, esp32_minimum_interval_ms: minimumIntervalMs } });
     return json({ ok: true });
   }
 
